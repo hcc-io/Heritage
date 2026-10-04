@@ -1,0 +1,3286 @@
+/* ======================================================================
+   HERITAGE CARPET COMPANY — SHARED SCRIPT (bilingual, single-page build)
+   Each page contains TWO content blocks: [data-lang="en"] and
+   [data-lang="ar"], both fully rendered on load. The language switch
+   just toggles which block is visible (hidden attribute) and flips
+   <html lang/dir> — no navigation, no reload.
+
+   Because both language blocks exist in the same document at once,
+   every render function below is scope-aware: it takes a `root` element
+   (one of the two .lang-block containers) and only ever queries inside
+   that root, using [data-role="..."] attributes instead of ids. This is
+   what makes it safe to render two languages' worth of the same UI
+   without them colliding.
+   ====================================================================== */
+window.Heritage = (function(){
+
+  // TODO: replace with the real store domain, e.g. "https://heritage-carpet.myshopify.com"
+  // or a custom checkout domain if one is mapped in Shopify settings.
+  const SHOPIFY_STORE = 'https://heritage-carpet.myshopify.com';
+
+  /* ======================================================================
+     GOOGLE SHEET RECORDING — EDIT THESE URLS
+     ----------------------------------------------------------------------
+     One Apps Script web-app URL per form, so each form can write to its own
+     separate sheet. Paste the deployment URL (ending in /exec) against the
+     matching form. Leave a value as '' to switch recording off for that
+     form — it keeps working and still opens WhatsApp/email, it just won't
+     log anything.
+
+     The Visit form's URL lives separately, in js/visit-data.js, because
+     that page already has its own data file.
+
+     Each URL must come from a deployment with "Who has access: Anyone",
+     otherwise visitors who aren't signed in to your Google Workspace will
+     silently fail to record. See GOOGLE-SHEET-SETUP.md.
+     ====================================================================== */
+  const SHEET_WEBHOOKS = {
+    projects: 'https://script.google.com/macros/s/AKfycbw7cmtZL70yTOK9AyfQYYw4CEsmVsdLU5t65OyOMz-LAZqangjRoQwucObXCksvwamb1w/exec',   // <-- Projects enquiry form  (projects.html)
+    bespoke:  'https://script.google.com/macros/s/AKfycbxk-VdkICkaD8rEcqlltnZl_QnLIG1o0Kcobz0nua1jeUIvrYNMUl9unshd6I5EfQAQ9A/exec'    // <-- Bespoke Studio wizard  (bespoke.html)
+  };
+
+  /* Fire-and-forget POST to an Apps Script endpoint.
+     Apps Script cannot return CORS headers, so this is sent 'no-cors':
+     the row is written but the browser may not read the reply, which means
+     a failure here is SILENT. Nothing about the visitor's journey may
+     depend on it — every caller sends the WhatsApp/email step regardless.
+     'text/plain' keeps this a "simple" request and avoids a CORS preflight
+     that Apps Script would reject. */
+  /* ---------------- phone validation ----------------
+     One rule, used by every form on the site: exactly 10 digits, nothing but
+     digits. Spaces and dashes a person types are ignored rather than
+     rejected, because "0552 144 855" is the same number and refusing it is
+     just pedantry. A phone number is now required everywhere — previously
+     the Projects form accepted an email instead, and Bespoke and the booking
+     page did not ask for one at all. */
+  /* 9 or 10 digits, because both forms are legitimate alongside the +966
+     country code already selected in the field:
+        552144855   — 9 digits, the national number
+        0552144855  — 10 digits, the same number with its leading zero
+     Accepting only one of them would reject a correctly written number from
+     roughly half the people who type it. */
+  const PHONE_LENGTHS = [9, 10];
+
+  function phoneDigits(v){
+    return String(v == null ? '' : v).replace(/[^0-9]/g, '');
+  }
+  function isValidPhone(v){
+    return PHONE_LENGTHS.indexOf(phoneDigits(v).length) > -1;
+  }
+
+  const sheetSendHistory = {};
+  function sendToSheet(url, payload){
+    if(!url) return;
+    let body, dedupeKey;
+    try{
+      body = JSON.stringify(payload);
+      // the dedupe key must EXCLUDE submittedAt — it changes on every click,
+      // which would make each payload look unique and defeat the check
+      const copy = {};
+      Object.keys(payload).forEach(k=>{ if(k !== 'submittedAt') copy[k] = payload[k]; });
+      dedupeKey = JSON.stringify(copy);
+    }catch(err){ return; }
+    if(sheetSendHistory[url] === dedupeKey) return;  // ignore a double-click
+    sheetSendHistory[url] = dedupeKey;
+    try{
+      fetch(url, {
+        method:'POST', mode:'no-cors',
+        headers:{'Content-Type':'text/plain;charset=utf-8'},
+        body: body
+      }).catch(function(){});
+    }catch(err){}
+  }
+
+  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /* ---------------- Shared icon set (commercial solutions cards) ---------------- */
+  const ICONS = {
+    hotels: '<path d="M4 21V7l8-4 8 4v14M9 21v-6h6v6" stroke-linecap="round" stroke-linejoin="round"/>',
+    offices: '<rect x="4" y="4" width="16" height="16" rx="1"/><path d="M9 4v16M15 4v16" stroke-linecap="round"/>',
+    mosques: '<path d="M4 21V11l8-7 8 7v10M8 21v-7a4 4 0 018 0v7" stroke-linecap="round" stroke-linejoin="round"/>',
+    retail: '<path d="M4 8l1-4h14l1 4M4 8v12h16V8M4 8h16M10 12v4h4v-4" stroke-linecap="round" stroke-linejoin="round"/>',
+    corporate: '<rect x="3" y="10" width="6" height="11"/><rect x="15" y="6" width="6" height="15"/><rect x="9" y="3" width="6" height="18"/>'
+  };
+
+  /* ---------------- Reusable SVG motif generator (collections/projects tiles) ---------------- */
+  /* ---------------- Shared phone field (country code + local number) ----------------
+     Used by the Bespoke Studio wizard, the Projects enquiry form, and Book a Visit —
+     one list, one markup builder, so all three stay consistent and a country only
+     needs to be added here once. Saudi Arabia is first and selected by default. */
+  const COUNTRY_CODES = [
+    {code:'+966', flag:'\u{1F1F8}\u{1F1E6}', name:'Saudi Arabia'},
+    {code:'+971', flag:'\u{1F1E6}\u{1F1EA}', name:'United Arab Emirates'},
+    {code:'+974', flag:'\u{1F1F6}\u{1F1E6}', name:'Qatar'},
+    {code:'+965', flag:'\u{1F1F0}\u{1F1FC}', name:'Kuwait'},
+    {code:'+973', flag:'\u{1F1E7}\u{1F1ED}', name:'Bahrain'},
+    {code:'+968', flag:'\u{1F1F4}\u{1F1F2}', name:'Oman'},
+    {code:'+20',  flag:'\u{1F1EA}\u{1F1EC}', name:'Egypt'},
+    {code:'+962', flag:'\u{1F1EF}\u{1F1F4}', name:'Jordan'},
+    {code:'+961', flag:'\u{1F1F1}\u{1F1E7}', name:'Lebanon'},
+    {code:'+964', flag:'\u{1F1EE}\u{1F1F6}', name:'Iraq'},
+    {code:'+967', flag:'\u{1F1FE}\u{1F1EA}', name:'Yemen'},
+    {code:'+970', flag:'\u{1F1F5}\u{1F1F8}', name:'Palestine'},
+    {code:'+963', flag:'\u{1F1F8}\u{1F1FE}', name:'Syria'},
+    {code:'+218', flag:'\u{1F1F1}\u{1F1FE}', name:'Libya'},
+    {code:'+212', flag:'\u{1F1F2}\u{1F1E6}', name:'Morocco'},
+    {code:'+216', flag:'\u{1F1F9}\u{1F1F3}', name:'Tunisia'},
+    {code:'+213', flag:'\u{1F1E9}\u{1F1FF}', name:'Algeria'},
+    {code:'+249', flag:'\u{1F1F8}\u{1F1E9}', name:'Sudan'},
+    {code:'+90',  flag:'\u{1F1F9}\u{1F1F7}', name:'Turkey'},
+    {code:'+92',  flag:'\u{1F1F5}\u{1F1F0}', name:'Pakistan'},
+    {code:'+91',  flag:'\u{1F1EE}\u{1F1F3}', name:'India'},
+    {code:'+880', flag:'\u{1F1E7}\u{1F1E9}', name:'Bangladesh'},
+    {code:'+94',  flag:'\u{1F1F1}\u{1F1F0}', name:'Sri Lanka'},
+    {code:'+977', flag:'\u{1F1F3}\u{1F1F5}', name:'Nepal'},
+    {code:'+63',  flag:'\u{1F1F5}\u{1F1ED}', name:'Philippines'},
+    {code:'+62',  flag:'\u{1F1EE}\u{1F1E9}', name:'Indonesia'},
+    {code:'+60',  flag:'\u{1F1F2}\u{1F1FE}', name:'Malaysia'},
+    {code:'+86',  flag:'\u{1F1E8}\u{1F1F3}', name:'China'},
+    {code:'+81',  flag:'\u{1F1EF}\u{1F1F5}', name:'Japan'},
+    {code:'+82',  flag:'\u{1F1F0}\u{1F1F7}', name:'South Korea'},
+    {code:'+44',  flag:'\u{1F1EC}\u{1F1E7}', name:'United Kingdom'},
+    {code:'+1',   flag:'\u{1F1FA}\u{1F1F8}', name:'United States / Canada'},
+    {code:'+33',  flag:'\u{1F1EB}\u{1F1F7}', name:'France'},
+    {code:'+49',  flag:'\u{1F1E9}\u{1F1EA}', name:'Germany'},
+    {code:'+39',  flag:'\u{1F1EE}\u{1F1F9}', name:'Italy'},
+    {code:'+34',  flag:'\u{1F1EA}\u{1F1F8}', name:'Spain'},
+    {code:'+31',  flag:'\u{1F1F3}\u{1F1F1}', name:'Netherlands'},
+    {code:'+41',  flag:'\u{1F1E8}\u{1F1ED}', name:'Switzerland'},
+    {code:'+61',  flag:'\u{1F1E6}\u{1F1FA}', name:'Australia'},
+    {code:'+27',  flag:'\u{1F1FF}\u{1F1E6}', name:'South Africa'},
+    {code:'+234', flag:'\u{1F1F3}\u{1F1EC}', name:'Nigeria'},
+    {code:'+254', flag:'\u{1F1F0}\u{1F1EA}', name:'Kenya'}
+  ];
+
+  function countryOptionsHTML(selectedCode){
+    const sel = selectedCode || '+966';
+    return COUNTRY_CODES.map(c=>
+      '<option value="'+c.code+'" title="'+c.name+'"'+(c.code===sel?' selected':'')+'>'+c.flag+' '+c.code+'</option>'
+    ).join('');
+  }
+
+  // codeAttr/numberAttr are full attribute strings (e.g. 'data-f="phone"' or 'id="x"'),
+  // since the three forms that use this identify their fields differently.
+  function phoneFieldHTML(codeAttr, numberAttr, selectedCode, numberValue){
+    return '<div class="phone-field">'+
+      '<select class="phone-code" '+codeAttr+'>'+countryOptionsHTML(selectedCode)+'</select>'+
+      '<input type="tel" inputmode="numeric" required aria-required="true" maxlength="18" '+
+        'class="field-input phone-number" '+numberAttr+' value="'+(numberValue||'').replace(/"/g,'&quot;')+'" placeholder="05X XXX XXXX">'+
+    '</div>'+
+    '<p class="phone-hint" data-role="phone-hint" hidden></p>';
+  }
+
+  /* Shows the reason a submit button is disabled. A greyed-out button with no
+     explanation is the most common way a form quietly loses someone — they
+     assume it's broken rather than that a field is short. Only complains once
+     the visitor has actually typed something. */
+  function updatePhoneHint(inputEl, lang){
+    if(!inputEl) return;
+    const wrap = inputEl.closest('.phone-field');
+    const hint = wrap && wrap.parentElement
+      ? wrap.parentElement.querySelector('[data-role="phone-hint"]') : null;
+    const raw = inputEl.value || '';
+    const digits = phoneDigits(raw);
+    const bad = raw.trim().length > 0 && !isValidPhone(raw);
+    inputEl.classList.toggle('is-invalid', bad);
+    if(!hint) return;
+    if(!bad){ hint.hidden = true; return; }
+    hint.hidden = false;
+    hint.textContent = (lang === 'ar')
+      ? 'يجب أن يتكون رقم الجوال من 9 أو 10 أرقام (أدخلت ' + digits.length + ').'
+      : 'Mobile number must be 9 or 10 digits (you have entered ' + digits.length + ').';
+  }
+
+  function motifSVG(type, color){
+    color = color || '#B7CC33';
+    const p = '<svg viewBox="0 0 200 200" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:100%;">';
+    const bg = '<rect width="200" height="200" fill="#2F2D2E"/>';
+    let inner = '';
+    if(type==='medallion'){
+      inner = '<circle cx="100" cy="100" r="80" stroke="'+color+'" stroke-width="0.6" fill="none"/><circle cx="100" cy="100" r="55" stroke="'+color+'" stroke-width="0.6" fill="none"/><path d="M100 40l28 60-28 60-28-60z" stroke="'+color+'" stroke-width="1.4" fill="none"/><circle cx="100" cy="100" r="10" fill="'+color+'" opacity="0.5"/>';
+    } else if(type==='lattice'){
+      inner = '';
+      for(let i=-2;i<10;i++){ inner += '<line x1="'+(i*24)+'" y1="0" x2="'+(i*24+200)+'" y2="200" stroke="'+color+'" stroke-width="0.5" opacity="0.6"/>'; inner += '<line x1="'+(i*24+200)+'" y1="0" x2="'+(i*24)+'" y2="200" stroke="'+color+'" stroke-width="0.5" opacity="0.6"/>'; }
+    } else if(type==='boteh'){
+      inner = '';
+      for(let x=10;x<200;x+=50){ for(let y=10;y<200;y+=50){ inner += '<path d="M'+x+' '+y+' q18 0 18 22 q0 16 -18 20 q-18 -4 -18 -20 q0 -22 18 -22z" stroke="'+color+'" stroke-width="0.9" fill="none" transform="rotate(15 '+x+' '+y+')"/>'; } }
+    } else if(type==='chevron'){
+      inner='';
+      for(let y=-20;y<220;y+=26){ inner += '<path d="M0 '+y+' L20 '+(y+13)+' L40 '+y+' L60 '+(y+13)+' L80 '+y+' L100 '+(y+13)+' L120 '+y+' L140 '+(y+13)+' L160 '+y+' L180 '+(y+13)+' L200 '+y+'" stroke="'+color+'" stroke-width="0.9" fill="none" opacity="0.7"/>'; }
+    } else if(type==='tile'){
+      inner='';
+      for(let x=0;x<=200;x+=25){ inner += '<line x1="'+x+'" y1="0" x2="'+x+'" y2="200" stroke="'+color+'" stroke-width="0.4" opacity="0.5"/>'; }
+      for(let y=0;y<=200;y+=25){ inner += '<line x1="0" y1="'+y+'" x2="200" y2="'+y+'" stroke="'+color+'" stroke-width="0.4" opacity="0.5"/>'; }
+    } else if(type==='arch'){
+      inner = '<path d="M40 200V110 A60 60 0 0 1 160 110 V200" stroke="'+color+'" stroke-width="1.2" fill="none"/><path d="M60 200V115 A40 40 0 0 1 140 115 V200" stroke="'+color+'" stroke-width="0.6" fill="none"/>';
+    } else if(type==='floorplan'){
+      inner = '<rect x="30" y="30" width="140" height="140" stroke="'+color+'" stroke-width="1" fill="none"/><line x1="30" y1="100" x2="170" y2="100" stroke="'+color+'" stroke-width="0.6"/><line x1="100" y1="30" x2="100" y2="100" stroke="'+color+'" stroke-width="0.6"/>';
+    } else if(type==='sofa'){
+      inner = '<rect x="30" y="90" width="140" height="55" rx="8" stroke="'+color+'" stroke-width="1.2" fill="none"/><rect x="20" y="80" width="24" height="70" rx="8" stroke="'+color+'" stroke-width="1.2" fill="none"/><rect x="156" y="80" width="24" height="70" rx="8" stroke="'+color+'" stroke-width="1.2" fill="none"/><line x1="50" y1="90" x2="150" y2="90" stroke="'+color+'" stroke-width="0.6"/>';
+    } else if(type==='lamp'){
+      inner = '<path d="M70 70 L130 70 L115 110 L85 110 Z" stroke="'+color+'" stroke-width="1.2" fill="none"/><line x1="100" y1="110" x2="100" y2="165" stroke="'+color+'" stroke-width="1.2"/><path d="M75 170 Q100 155 125 170" stroke="'+color+'" stroke-width="1.2" fill="none"/>';
+    } else if(type==='vase'){
+      inner = '<path d="M85 60 L115 60 L120 95 Q135 125 120 155 L80 155 Q65 125 80 95 Z" stroke="'+color+'" stroke-width="1.2" fill="none"/><line x1="85" y1="75" x2="115" y2="75" stroke="'+color+'" stroke-width="0.6"/>';
+    } else if(type==='frame'){
+      inner = '<rect x="55" y="45" width="90" height="110" stroke="'+color+'" stroke-width="1.4" fill="none"/><rect x="68" y="58" width="64" height="84" stroke="'+color+'" stroke-width="0.6" fill="none"/><path d="M78 130 L95 105 L110 125 L122 112" stroke="'+color+'" stroke-width="0.9" fill="none"/>';
+    } else {
+      inner = '<circle cx="100" cy="100" r="70" stroke="'+color+'" stroke-width="0.8" fill="none"/>';
+    }
+    return p+bg+inner+'</svg>';
+  }
+
+  /* ---------------- Color helpers (bespoke studio preview) ---------------- */
+  function hexToRgb(hex){
+    hex = hex.replace('#','');
+    if(hex.length===3) hex = hex.split('').map(c=>c+c).join('');
+    const num = parseInt(hex,16);
+    return { r:(num>>16)&255, g:(num>>8)&255, b:num&255 };
+  }
+  function isDarkColor(hex){
+    const {r,g,b} = hexToRgb(hex);
+    return (0.299*r + 0.587*g + 0.114*b) < 140;
+  }
+  function shade(hex, percent){
+    const {r,g,b} = hexToRgb(hex);
+    const f = percent < 0 ? 0 : 255, p = Math.abs(percent);
+    const nr = Math.round((f-r)*p)+r, ng = Math.round((f-g)*p)+g, nb = Math.round((f-b)*p)+b;
+    return 'rgb('+nr+','+ng+','+nb+')';
+  }
+
+  /* ---------------- Pattern glyphs (bespoke studio) ---------------- */
+  function patternIcon(type, color){
+    let inner = '';
+    if(type==='medallion'){
+      inner = '<path d="M100 12l20 18-20 18-20-18z" stroke="'+color+'" stroke-width="1.4" fill="none"/><circle cx="100" cy="30" r="22" stroke="'+color+'" stroke-width="0.6" fill="none"/>';
+    } else if(type==='botanical'){
+      inner = [0,1,2,3,4].map(i=>'<circle cx="'+(60+i*20)+'" cy="30" r="5" stroke="'+color+'" stroke-width="1" fill="none"/>').join('')+'<circle cx="100" cy="30" r="2.5" fill="'+color+'"/>';
+    } else if(type==='geometric'){
+      inner = '<path d="M40 30 L60 15 L80 30 L100 15 L120 30 L140 15 L160 30" stroke="'+color+'" stroke-width="1.4" fill="none"/>';
+    } else if(type==='abstract'){
+      inner = '<path d="M30 40 Q70 5 100 30 T170 20" stroke="'+color+'" stroke-width="1.4" fill="none"/>';
+    } else {
+      inner = '<line x1="60" y1="30" x2="140" y2="30" stroke="'+color+'" stroke-width="0.8" opacity="0.5"/>';
+    }
+    return '<svg viewBox="0 0 200 60" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:100%;">'+inner+'</svg>';
+  }
+  function patternGlyph(type, color, cx, cy, r){
+    if(type==='medallion'){
+      return '<circle cx="'+cx+'" cy="'+cy+'" r="'+(r*0.7)+'" stroke="'+color+'" stroke-width="1" fill="none" opacity="0.85"/>'+
+             '<path d="M'+cx+' '+(cy-r*0.5)+'L'+(cx+r*0.5)+' '+cy+'L'+cx+' '+(cy+r*0.5)+'L'+(cx-r*0.5)+' '+cy+'Z" stroke="'+color+'" stroke-width="1.2" fill="none" opacity="0.9"/>';
+    } else if(type==='botanical'){
+      let s='';
+      for(let i=0;i<6;i++){
+        const a = (Math.PI*2*i)/6;
+        const x = cx + Math.cos(a)*r*0.55, y = cy + Math.sin(a)*r*0.55;
+        s += '<circle cx="'+x+'" cy="'+y+'" r="'+(r*0.16)+'" stroke="'+color+'" stroke-width="0.9" fill="none" opacity="0.85"/>';
+      }
+      s += '<circle cx="'+cx+'" cy="'+cy+'" r="'+(r*0.1)+'" fill="'+color+'" opacity="0.85"/>';
+      return s;
+    } else if(type==='geometric'){
+      let s='<g opacity="0.85">';
+      const w = r*1.7, step = w/4;
+      for(let i=0;i<4;i++){
+        const x1 = cx-w/2+i*step, x2 = cx-w/2+(i+1)*step;
+        const yTop = cy-r*0.35, yBot = cy+r*0.35;
+        s += '<path d="M'+x1+' '+(i%2===0?yBot:yTop)+' L'+x2+' '+(i%2===0?yTop:yBot)+'" stroke="'+color+'" stroke-width="1.2" fill="none"/>';
+      }
+      s += '</g>';
+      return s;
+    } else if(type==='abstract'){
+      return '<path d="M'+(cx-r*0.8)+' '+(cy+r*0.3)+' Q'+cx+' '+(cy-r*0.9)+' '+(cx+r*0.8)+' '+(cy-r*0.1)+'" stroke="'+color+'" stroke-width="1.2" fill="none" opacity="0.85"/>'+
+             '<path d="M'+(cx-r*0.6)+' '+(cy+r*0.6)+' Q'+cx+' '+(cy+r*0.1)+' '+(cx+r*0.6)+' '+(cy+r*0.65)+'" stroke="'+color+'" stroke-width="1" fill="none" opacity="0.6"/>';
+    }
+    return ''; // plain
+  }
+
+  /* ---------------- Reusable image carousel (collections / projects / products) ----------------
+     One system, three callers. Each card can supply an `images` array; if it doesn't
+     (or the array is empty), this falls back to the original single-file convention
+     so existing content never breaks:
+       collections -> Assets/collections/{slug}.png
+       projects    -> Assets/projects/{slug}.jpg
+       products    -> Assets/products/<division>/<category>[/<sub>]/{handle}.jpg
+     Markup is built as a plain HTML string (matching how every other card here is
+     rendered), then initCarousels() wires up rotation/hover/dots/error-handling
+     afterwards, once the HTML is actually in the DOM. -------------------------------- */
+
+  function resolveImages(item, kind){
+    if(Array.isArray(item.images) && item.images.length){
+      return item.images.filter(src => typeof src === 'string' && src.trim().length > 0);
+    }
+    // backward-compatible single-image fallback, matching the original naming convention
+    if(kind==='collections' && item.slug) return ['Assets/collections/'+item.slug+'.png'];
+    if(kind==='projects' && item.slug) return ['Assets/projects/'+item.slug+'.jpg'];
+    if(kind==='products' && item.handle) return ['Assets/products/'+productFolder(item)+item.handle+'.jpg'];
+    return [];
+  }
+
+  /* Product images live in folders mirroring the product tree:
+       Assets/products/<division>/<category>[/<sub>]/<file>
+     A product that lists its images explicitly is unaffected; this only
+     builds the fallback path, so it has to follow the same shape or the
+     guess would point at a folder that no longer exists. */
+  function productFolder(item){
+    const tree = window.HeritageData && window.HeritageData.tree;
+    const cats = item.category || [];
+    if(!tree || !cats.length) return '';
+    const div = cats[0];
+    if(!tree.divisions[div]) return 'furniture/';          // off-tree items
+    // the division key is 'furniture-division' (so it cannot clash with the
+    // older 'furniture' product tag), but the folder is just 'furniture'
+    let path = (div === 'furniture-division' ? 'furniture' : div) + '/';
+    const cat = cats[1];
+    if(cat && tree.divisions[div].indexOf(cat) > -1){
+      path += cat + '/';
+      const subs = tree.subs[cat] || [];
+      for(let i = 2; i < cats.length; i++){
+        if(subs.indexOf(cats[i]) > -1){ path += cats[i] + '/'; break; }
+      }
+    }
+    return path;
+  }
+
+function buildCarouselMarkup(images){
+  if(!images.length) return '';
+
+  const slides = images.map((src,i)=>
+    '<div class="carousel-slide'+(i===0?' active':'')+'" data-index="'+i+'"><img src="'+src+'" alt="" loading="lazy"></div>'
+  ).join('');
+
+  const dots = images.length > 1
+    ? '<div class="carousel-dots">'+images.map((_,i)=>
+        '<span class="carousel-dot'+(i===0?' active':'')+'" data-index="'+i+'"></span>'
+      ).join('')+'</div>'
+    : '';
+
+  const arrows = images.length > 1
+    ? '<button type="button" class="carousel-arrow carousel-prev" aria-label="Previous image" data-carousel-prev>‹</button>' +
+      '<button type="button" class="carousel-arrow carousel-next" aria-label="Next image" data-carousel-next>›</button>'
+    : '';
+
+  return '<div class="motif-carousel">'+slides+dots+arrows+'</div>';
+}
+  // Stop any running rotation timers before a grid's innerHTML gets replaced (filtering/
+  // sorting on the collections page), so old detached carousels don't keep ticking in the background.
+  function clearCarousels(scopeEl){
+    scopeEl.querySelectorAll('.motif-carousel').forEach(c=>{
+      if(c._carouselTimer) clearInterval(c._carouselTimer);
+    });
+  }
+
+  function initCarousels(root){
+  root.querySelectorAll('.motif-carousel').forEach(carousel=>{
+    const slides = Array.from(carousel.querySelectorAll('.carousel-slide'));
+    const dotsEl = carousel.querySelector('.carousel-dots');
+    const dots = dotsEl ? Array.from(dotsEl.querySelectorAll('.carousel-dot')) : [];
+    if(!slides.length){
+      carousel.remove();
+      return;
+    }
+    let valid = slides.map((_,i)=>i);
+    let current = 0;
+    function showSlide(i){
+      if(!valid.length) return;
+      const prev = current;
+      current = i;
+      slides.forEach((s,idx)=>{
+        s.classList.toggle('active', idx===i);
+      });
+      // Both slides are semi-transparent midway through a crossfade, so their combined
+      // opacity dips below 1 and the SVG motif underneath flashes through. Keeping the
+      // outgoing slide fully opaque beneath the incoming one closes that gap.
+      if(prev !== i && slides[prev]){
+        const out = slides[prev];
+        // clear any slide still held from an earlier, faster switch so only ever
+        // one slide sits beneath the active one
+        slides.forEach(s=>{
+          if(s !== out && s.classList.contains('holding')){
+            if(s._holdTimer){ clearTimeout(s._holdTimer); s._holdTimer = null; }
+            s.classList.remove('holding');
+          }
+        });
+        out.classList.add('holding');
+        if(out._holdTimer) clearTimeout(out._holdTimer);
+        out._holdTimer = setTimeout(function(){
+          out.classList.remove('holding');
+          out._holdTimer = null;
+        }, 700); // just past the .6s fade
+      }
+      dots.forEach((d,idx)=>{
+        d.classList.toggle('active', idx===i);
+      });
+    }
+    function next(){
+      if(valid.length < 2) return;
+      const pos = valid.indexOf(current);
+      showSlide(valid[(pos+1) % valid.length]);
+    }
+
+    function previous(){
+      if(valid.length < 2) return;
+      const pos = valid.indexOf(current);
+      showSlide(valid[(pos - 1 + valid.length) % valid.length]);
+    }
+    function stopAuto(){
+      if(carousel._carouselTimer){
+        clearInterval(carousel._carouselTimer);
+        carousel._carouselTimer = null;
+      }
+    }
+    function startAuto(){
+      if(reducedMotion || valid.length < 2) return;
+      stopAuto();
+      carousel._carouselTimer = setInterval(next, 4800);
+    }
+    // Failed image handling
+    slides.forEach((slideEl, i)=>{
+      const img = slideEl.querySelector('img');
+      if(!img) return;
+      img.addEventListener('error', function(){
+        const dot = dots[i];
+        slideEl.remove();
+        if(dot) dot.remove();
+        valid = valid.filter(v=>v!==i);
+        if(!valid.length){
+          stopAuto();
+          carousel.remove();
+          return;
+        }
+        if(current===i){
+          showSlide(valid[0]);
+        }
+      }, {once:true});
+    });
+    // Pause automatic rotation while hovering
+    if(slides.length > 1){
+      carousel.addEventListener('mouseenter', stopAuto);
+      carousel.addEventListener('mouseleave', startAuto);
+    }
+    // Existing dots
+    if(dotsEl){
+      dotsEl.addEventListener('click', function(e){
+        e.stopPropagation();
+        const dot = e.target.closest('.carousel-dot');
+        if(!dot) return;
+        showSlide(parseInt(dot.dataset.index,10));
+        startAuto();
+      });
+    }
+    // NEW: Previous / Next buttons
+    const prevBtn = carousel.querySelector('[data-carousel-prev]');
+    const nextBtn = carousel.querySelector('[data-carousel-next]');
+    if(prevBtn){
+      prevBtn.addEventListener('click', function(e){
+        e.preventDefault();
+        e.stopPropagation();
+        previous();
+        startAuto();
+      });
+    }
+    if(nextBtn){
+      nextBtn.addEventListener('click', function(e){
+        e.preventDefault();
+        e.stopPropagation();
+        next();
+        startAuto();
+      });
+    }
+    // Keep the existing automatic rotation
+    startAuto();
+  });
+}
+
+  /* ---------------- Product detail page (product.html) ----------------
+     Reads ?handle=... from the URL and renders the matching product from
+     HeritageData. Called once per language block, like every other page. */
+  function renderProductPage(config, root){
+    root = root || document;
+    const lang = root.getAttribute('data-lang') || 'en';
+    const L = config.labels;
+    const i18n = config.i18n;
+    const D = window.HeritageData;
+    if(!D) return;
+
+    const handle = new URLSearchParams(window.location.search).get('handle');
+    const product = handle ? D.find(handle, lang) : null;
+
+    const stage = root.querySelector('[data-role="pdp"]');
+    const missing = root.querySelector('[data-role="pdp-missing"]');
+    if(!stage) return;
+
+    if(!product){
+      stage.hidden = true;
+      if(missing) missing.hidden = false;
+      return;
+    }
+    if(missing) missing.hidden = true;
+    stage.hidden = false;
+
+    const detail = D.detailFor(product, lang);
+    const images = resolveImages(product, 'products');
+    const shopUrl = SHOPIFY_STORE + '/products/' + product.handle;
+
+    // ---- breadcrumb + title ----
+    const catKey = product.category[product.category.length-1];
+    const setText = (role, text) => { const el = root.querySelector('[data-role="'+role+'"]'); if(el) el.textContent = text; };
+    setText('pdp-crumb', L.category[catKey] || '');
+    setText('pdp-origin', L.category[catKey] || '');
+    setText('pdp-name', product.name);
+
+    // ---- gallery: main image + thumbnails ----
+    const galleryMain = root.querySelector('[data-role="pdp-gallery-main"]');
+    const galleryThumbs = root.querySelector('[data-role="pdp-gallery-thumbs"]');
+    if(galleryMain){
+      const swatchColor = product.color==='ivory' ? '#B7CC33' : '#C9DC5E';
+      galleryMain.innerHTML = motifSVG(product.motif, swatchColor) +
+        images.map((src,i)=>'<img class="pdp-main-img'+(i===0?' active':'')+'" data-index="'+i+'"'+(i===0?'':' loading="lazy" decoding="async"')+' src="'+src+'" alt="'+product.name+'">').join('');
+      if(galleryThumbs){
+        galleryThumbs.innerHTML = images.map((src,i)=>
+          '<button type="button" class="pdp-thumb'+(i===0?' active':'')+'" data-index="'+i+'" aria-label="'+(i+1)+'"><img src="'+src+'" alt="" loading="lazy"></button>'
+        ).join('');
+      }
+      // any image that fails drops out of the gallery; the SVG motif stays underneath
+      galleryMain.querySelectorAll('.pdp-main-img').forEach(img=>{
+        img.addEventListener('error', function(){
+          const idx = img.dataset.index;
+          const thumb = galleryThumbs && galleryThumbs.querySelector('.pdp-thumb[data-index="'+idx+'"]');
+          if(thumb) thumb.remove();
+          const wasActive = img.classList.contains('active');
+          img.remove();
+          if(wasActive){
+            const first = galleryMain.querySelector('.pdp-main-img');
+            if(first) first.classList.add('active');
+            const firstThumb = galleryThumbs && galleryThumbs.querySelector('.pdp-thumb');
+            if(firstThumb) firstThumb.classList.add('active');
+          }
+        }, {once:true});
+      });
+      if(galleryThumbs){
+        galleryThumbs.addEventListener('click', function(e){
+          const btn = e.target.closest('.pdp-thumb');
+          if(!btn) return;
+          const i = btn.dataset.index;
+          galleryThumbs.querySelectorAll('.pdp-thumb').forEach(b=>b.classList.toggle('active', b===btn));
+          // same crossfade gap as the card carousels: hold the outgoing image opaque
+          // beneath the incoming one so the motif underneath never flashes through
+          const outgoing = galleryMain.querySelector('.pdp-main-img.active');
+          galleryMain.querySelectorAll('.pdp-main-img').forEach(im=>im.classList.toggle('active', im.dataset.index===i));
+          if(outgoing && outgoing.dataset.index !== i){
+            outgoing.classList.add('holding');
+            if(outgoing._holdTimer) clearTimeout(outgoing._holdTimer);
+            outgoing._holdTimer = setTimeout(function(){
+              outgoing.classList.remove('holding');
+              outgoing._holdTimer = null;
+            }, 550); // just past the .45s fade
+          }
+        });
+      }
+    }
+
+    // ---- sale badge / price note ----
+    const saleEl = root.querySelector('[data-role="pdp-sale"]');
+    if(saleEl){
+      if(product.sale){
+        saleEl.hidden = false;
+        saleEl.textContent = i18n.saleBadge.replace('{percent}', product.sale.percent);
+      } else {
+        saleEl.hidden = true;
+      }
+    }
+
+    // ---- spec table ----
+    const specEl = root.querySelector('[data-role="pdp-specs"]');
+    if(specEl){
+      const rows = [];
+      const push = (k,v)=>{ if(v) rows.push([k,v]); };
+      push(i18n.specLabels.category, L.category[catKey]);
+      push(i18n.specLabels.material, L.material[product.material]);
+      push(i18n.specLabels.color, L.color[product.color]);
+      if(product.size && L.size[product.size]) push(i18n.specLabels.size, L.size[product.size]);
+      push(i18n.specLabels.origin, detail.origin);
+      push(i18n.specLabels.construction, detail.construction);
+      push(i18n.specLabels.pile, detail.pile);
+      push(i18n.specLabels.knots, detail.knots);
+      if(product.room && product.room.length){
+        push(i18n.specLabels.room, product.room.map(r=>L.room[r]).filter(Boolean).join(', '));
+      }
+      // Extra rows straight from a manufacturer spec sheet, when the product
+      // carries them (carpet tiles: pile weight, tile size, per box, backing,
+      // installation, antistatic). Supplied per language in js/data.js.
+      if(Array.isArray(product.specs)){
+        product.specs.forEach(function(r){ push(r[0], r[1]); });
+      }
+      specEl.innerHTML = rows.map(r=>
+        '<div class="spec-row"><span class="spec-key">'+r[0]+'</span><span class="spec-val">'+r[1]+'</span></div>'
+      ).join('');
+    }
+
+    // ---- story + care ----
+    setText('pdp-story', detail.story);
+    const careEl = root.querySelector('[data-role="pdp-care"]');
+    if(careEl) careEl.innerHTML = detail.care.map(c=>'<li>'+c+'</li>').join('');
+
+    // ---- actions ----
+    //const buyBtn = root.querySelector('[data-role="pdp-buy"]');
+    //if(buyBtn) buyBtn.setAttribute('href', shopUrl);
+    const inqBtn = root.querySelector('[data-role="pdp-inquire"]');
+    if(inqBtn) inqBtn.setAttribute('href', 'mailto:info@heritagecarpet.sa?subject='+encodeURIComponent(i18n.inquireSubjectPrefix + product.name));
+    const waBtn = root.querySelector('[data-role="pdp-whatsapp"]');
+    if(waBtn) waBtn.setAttribute('href', 'https://wa.me/966552144855?text='+encodeURIComponent(i18n.waPrefix + product.name));
+    const roomBtn = root.querySelector('[data-role="pdp-room"]');
+    if(roomBtn) roomBtn.setAttribute('href', 'room.html?handle='+encodeURIComponent(product.handle));
+
+    // ---- related: same category, excluding this one ----
+    const relatedEl = root.querySelector('[data-role="pdp-related"]');
+    if(relatedEl){
+      const related = (D.products[lang]||D.products.en)
+        .filter(p => p.handle !== product.handle && p.category.some(c => product.category.indexOf(c) !== -1))
+        .slice(0,4);
+      relatedEl.innerHTML = related.map(p=>{
+        const url = 'product.html?handle='+encodeURIComponent(p.handle);
+        const sc = p.color==='ivory' ? '#B7CC33' : '#C9DC5E';
+        return '<div class="product-card"><div class="product-media">'+
+          '<div class="motif">'+motifSVG(p.motif, sc)+buildCarouselMarkup(resolveImages(p,'products').slice(0,1))+'</div>'+
+          '<a class="product-media-link" href="'+url+'" aria-label="'+p.name+'"></a></div>'+
+          '<div class="product-body"><div class="product-name"><a href="'+url+'">'+p.name+'</a></div></div></div>';
+      }).join('');
+      initCarousels(relatedEl);
+    }
+
+    // Feed the title back into the per-language title attributes rather than setting
+    // document.title directly — setLanguage() runs after this on DOMContentLoaded and
+    // would otherwise overwrite it with the page's generic title, and this way the
+    // title also stays correct when the visitor switches language.
+    const brand = (lang==='ar') ? 'شركة التراث للسجاد' : 'Heritage Carpet Company';
+    document.documentElement.setAttribute('data-title-'+lang, product.name + ' — ' + brand);
+    if(document.documentElement.getAttribute('lang') === lang){
+      document.title = product.name + ' — ' + brand;
+    }
+  }
+
+  /* ---------------- Offers / sale page (offers.html) ----------------
+     Reads every product carrying a `sale` object from HeritageData. Add or
+     remove a sale by editing that one field in js/data.js — this page and the
+     badges on the collection grid both follow automatically. */
+  function renderOffersPage(config, root){
+    root = root || document;
+    const lang = root.getAttribute('data-lang') || 'en';
+    const L = config.labels, i18n = config.i18n;
+    const D = window.HeritageData;
+    if(!D) return;
+
+    const items = D.onSale(lang);
+    const grid = root.querySelector('[data-role="offers-grid"]');
+    const empty = root.querySelector('[data-role="offers-empty"]');
+    const countEl = root.querySelector('[data-role="offers-count"]');
+
+    if(countEl) countEl.textContent = i18n.count.replace('{n}', items.length);
+    if(empty) empty.hidden = items.length > 0;
+    if(!grid) return;
+
+    // Group by the campaign note so several promotions can run side by side.
+    const groups = {};
+    items.forEach(p=>{
+      const key = (p.sale && p.sale.note) || 'general';
+      (groups[key] = groups[key] || []).push(p);
+    });
+
+    grid.innerHTML = Object.keys(groups).map(key=>{
+      const g = groups[key];
+      const meta = i18n.campaigns[key] || i18n.campaigns.general;
+      const cards = g.map(p=>{
+        const url = 'product.html?handle='+encodeURIComponent(p.handle);
+        const sc = p.color==='ivory' ? '#B7CC33' : '#C9DC5E';
+        const metaParts = [];
+        if(L.material[p.material]) metaParts.push(L.material[p.material]);
+        if(p.size && L.size[p.size]) metaParts.push(L.size[p.size].split(' (')[0].split('(')[0]);
+        return '<div class="product-card">'+
+          '<div class="product-media"><span class="product-tag sale">-'+p.sale.percent+'%</span>'+
+          '<div class="motif">'+motifSVG(p.motif, sc)+buildCarouselMarkup(resolveImages(p,'products'))+'</div>'+
+          '<a class="product-media-link" href="'+url+'" aria-label="'+p.name+'"></a></div>'+
+          '<div class="product-body">'+
+            '<div class="product-origin">'+(L.category[p.category[p.category.length-1]]||'')+'</div>'+
+            '<div class="product-name"><a href="'+url+'">'+p.name+'</a></div>'+
+            '<div class="product-meta">'+metaParts.join(' \u00b7 ')+'</div>'+
+            '<div class="product-actions"><a class="btn btn-fill btn-sm" href="'+url+'">'+i18n.viewDetails+'</a></div>'+
+          '</div></div>';
+      }).join('');
+      return '<div class="offer-group">'+
+        '<div class="offer-head">'+
+          '<div class="eyebrow on-light">'+meta.kicker+'</div>'+
+          '<h2>'+meta.title+'</h2>'+
+          '<p>'+meta.blurb+'</p>'+
+          (g[0].sale.until ? '<div class="offer-until" data-until="'+g[0].sale.until+'"></div>' : '')+
+        '</div>'+
+        '<div class="product-grid">'+cards+'</div>'+
+      '</div>';
+    }).join('');
+
+    // "Ends in N days" — computed live so nothing goes stale in the markup.
+    root.querySelectorAll('.offer-until').forEach(el=>{
+      const end = new Date(el.dataset.until + 'T23:59:59');
+      const days = Math.ceil((end - new Date()) / 86400000);
+      el.textContent = days > 0 ? i18n.endsIn.replace('{n}', days) : i18n.ended;
+      el.classList.toggle('expired', days <= 0);
+    });
+
+    initCarousels(grid);
+    revealNow(grid);
+  }
+
+  /* ---------------- Showroom appointment booking (visit.html) ----------------
+     There is no backend on a static site, so the picked slot is handed off to
+     WhatsApp or email as a fully written request rather than silently
+     "booked" — the page says so plainly. Slots come from each showroom's real
+     opening hours and Friday is handled separately. */
+  function renderBookingPage(config, root){
+    root = root || document;
+    const i18n = config.i18n;
+    const state = { brand:null, showroom:null, date:null, slot:null, name:'', phone:'', phoneCode:'+966', notes:'' };
+
+    const brandsEl    = root.querySelector('[data-role="book-brands"]');
+    const showroomsEl = root.querySelector('[data-role="book-showrooms"]');
+    const datesEl     = root.querySelector('[data-role="book-dates"]');
+    const slotsEl     = root.querySelector('[data-role="book-slots"]');
+    const summaryEl   = root.querySelector('[data-role="book-summary"]');
+    const confirmBtn  = root.querySelector('[data-role="book-confirm"]');
+    const emailBtn    = root.querySelector('[data-role="book-email"]');
+    const phoneCodeEl = root.querySelector('[data-role="book-phone-code"]');
+    if(!showroomsEl) return;
+
+    // same list used by the Bespoke Studio and Projects enquiry forms
+    if(phoneCodeEl) phoneCodeEl.innerHTML = countryOptionsHTML(state.phoneCode);
+
+    // brand-grouped showrooms: config.showroomsByBrand[key].rooms. A flattened
+    // lookup list is kept alongside it so slotsFor()/labelFor() can find a
+    // room by key regardless of which brand is currently active — the
+    // selected room doesn't stop existing just because you switched brands
+    // to look around, only the visible LIST of choices changes.
+    const brandOrder = config.brandOrder || [];
+    const byBrand = config.showroomsByBrand || {};
+    const allRooms = [];
+    brandOrder.forEach(bk=>{ (byBrand[bk] && byBrand[bk].rooms || []).forEach(r=>allRooms.push(r)); });
+
+    function renderBrands(){
+      if(!brandsEl) return;
+      brandsEl.innerHTML = brandOrder.map(bk=>
+        '<button type="button" class="book-brand-btn'+(state.brand===bk?' active':'')+'" data-brand="'+bk+'">'+byBrand[bk].label+'</button>'
+      ).join('');
+    }
+
+    // ---- showroom chooser: only the active brand's rooms are listed ----
+    function renderShowrooms(){
+      if(!state.brand){
+        showroomsEl.innerHTML = '<p class="slot-hint">'+(i18n.pickBrand||'')+'</p>';
+        return;
+      }
+      const rooms = (byBrand[state.brand] && byBrand[state.brand].rooms) || [];
+      showroomsEl.innerHTML = rooms.map(s=>
+        '<div class="option-card'+(state.showroom===s.key?' selected':'')+'" data-showroom="'+s.key+'"><h4>'+s.label+'<span class="check"></span></h4><p>'+s.hours+'</p></div>'
+      ).join('');
+    }
+
+    if(brandsEl){
+      brandsEl.addEventListener('click', function(e){
+        const btn = e.target.closest('.book-brand-btn');
+        if(!btn || btn.dataset.brand === state.brand) return;
+        state.brand = btn.dataset.brand;
+        state.showroom = null; state.slot = null;
+        renderBrands(); renderShowrooms(); renderSlots(); renderSummary();
+      });
+    }
+
+    // ---- next 14 days ----
+    function buildDates(){
+      const out = [];
+      const today = new Date(); today.setHours(0,0,0,0);
+      for(let i=1;i<=14;i++){
+        const d = new Date(today.getTime() + i*86400000);
+        out.push(d);
+      }
+      return out;
+    }
+    const dates = buildDates();
+
+    function dayKey(d){ return d.toISOString().slice(0,10); }
+    function isFriday(d){ return d.getDay() === 5; }
+
+    function renderDates(){
+      datesEl.innerHTML = dates.map(d=>{
+        const key = dayKey(d);
+        const sel = state.date === key ? ' selected' : '';
+        return '<button type="button" class="date-chip'+sel+'" data-date="'+key+'">'+
+          '<span class="date-dow">'+i18n.days[d.getDay()]+'</span>'+
+          '<span class="date-num">'+d.getDate()+'</span>'+
+          '<span class="date-mon">'+i18n.months[d.getMonth()]+'</span>'+
+        '</button>';
+      }).join('');
+    }
+
+    function slotsFor(dateKey, showroomKey){
+      const sr = allRooms.filter(s=>s.key===showroomKey)[0];
+      if(!sr) return [];
+      const d = new Date(dateKey + 'T00:00:00');
+      return isFriday(d) ? sr.slotsFri : sr.slots;
+    }
+
+    function renderSlots(){
+      if(!state.date || !state.showroom){
+        slotsEl.innerHTML = '<p class="slot-hint">'+i18n.pickFirst+'</p>';
+        return;
+      }
+      const list = slotsFor(state.date, state.showroom);
+      if(!list.length){
+        slotsEl.innerHTML = '<p class="slot-hint">'+i18n.noSlots+'</p>';
+        return;
+      }
+      slotsEl.innerHTML = list.map(t=>
+        '<button type="button" class="slot-chip'+(state.slot===t?' selected':'')+'" data-slot="'+t+'">'+t+'</button>'
+      ).join('');
+    }
+
+    function labelFor(key){
+      const s = allRooms.filter(x=>x.key===key)[0];
+      return s ? s.label : '';
+    }
+
+    function prettyDate(key){
+      if(!key) return i18n.notSelected;
+      const d = new Date(key+'T00:00:00');
+      return i18n.days[d.getDay()] + ', ' + d.getDate() + ' ' + i18n.months[d.getMonth()];
+    }
+
+    function renderSummary(){
+      if(!summaryEl) return;
+      const brandLabel = state.brand && byBrand[state.brand] ? byBrand[state.brand].label : i18n.notSelected;
+      const rows = [
+        [i18n.sumLabels.brand,    brandLabel],
+        [i18n.sumLabels.showroom, state.showroom ? labelFor(state.showroom) : i18n.notSelected],
+        [i18n.sumLabels.date,     prettyDate(state.date)],
+        [i18n.sumLabels.time,     state.slot || i18n.notSelected],
+        [i18n.sumLabels.name,     state.name || i18n.notSelected],
+        [i18n.sumLabels.phone,    state.phone ? state.phoneCode+' '+state.phone : i18n.notSelected]
+      ];
+      summaryEl.innerHTML = rows.map(r=>
+        '<div class="preview-summary-row summary-light"><span>'+r[0]+'</span><span>'+r[1]+'</span></div>'
+      ).join('');
+      const ready = !!(state.showroom && state.date && state.slot && state.name.trim() && isValidPhone(state.phone));
+      if(confirmBtn) confirmBtn.classList.toggle('is-disabled', !ready);
+      if(emailBtn) emailBtn.classList.toggle('is-disabled', !ready);
+      if(ready){
+        const lines = [
+          i18n.sumLabels.brand+': '+brandLabel,
+          i18n.sumLabels.showroom+': '+labelFor(state.showroom),
+          i18n.sumLabels.date+': '+prettyDate(state.date),
+          i18n.sumLabels.time+': '+state.slot,
+          i18n.sumLabels.name+': '+state.name,
+          i18n.sumLabels.phone+': '+(state.phone ? state.phoneCode+' '+state.phone : '-'),
+          i18n.sumLabels.notes+': '+(state.notes||'-')
+        ].join('\n');
+        const body = i18n.requestIntro + '\n\n' + lines;
+        if(confirmBtn) confirmBtn.setAttribute('href','https://wa.me/966552144855?text='+encodeURIComponent(body));
+        if(emailBtn) emailBtn.setAttribute('href','mailto:info@heritagecarpet.sa?subject='+encodeURIComponent(i18n.emailSubject)+'&body='+encodeURIComponent(body));
+      } else {
+        if(confirmBtn) confirmBtn.setAttribute('href','#');
+        if(emailBtn) emailBtn.setAttribute('href','#');
+      }
+    }
+
+    showroomsEl.addEventListener('click', function(e){
+      const card = e.target.closest('[data-showroom]');
+      if(!card) return;
+      state.showroom = card.dataset.showroom;
+      state.slot = null;
+      showroomsEl.querySelectorAll('.option-card').forEach(c=>c.classList.toggle('selected', c===card));
+      renderSlots(); renderSummary();
+    });
+    datesEl.addEventListener('click', function(e){
+      const btn = e.target.closest('[data-date]');
+      if(!btn) return;
+      state.date = btn.dataset.date;
+      state.slot = null;
+      renderDates(); renderSlots(); renderSummary();
+    });
+    slotsEl.addEventListener('click', function(e){
+      const btn = e.target.closest('[data-slot]');
+      if(!btn) return;
+      state.slot = btn.dataset.slot;
+      renderSlots(); renderSummary();
+    });
+    ['name','phone','notes'].forEach(f=>{
+      const el = root.querySelector('[data-role="book-'+f+'"]');
+      if(el) el.addEventListener('input', function(){
+        state[f] = el.value;
+        if(f === 'phone') updatePhoneHint(el, root.getAttribute('data-lang') || 'en');
+        renderSummary();
+      });
+    });
+    if(phoneCodeEl) phoneCodeEl.addEventListener('change', function(){ state.phoneCode = phoneCodeEl.value; renderSummary(); });
+    // ---- record the booking to its Google Sheet (see sendToSheet above) ----
+    const bookingLang = root.getAttribute('data-lang') || 'en';
+    function recordBooking(){
+      sendToSheet(config.webhookUrl, {
+        form:        'visit',
+        brand:       state.brand && byBrand[state.brand] ? byBrand[state.brand].label : '',
+        showroom:    state.showroom ? labelFor(state.showroom) : '',
+        showroomKey: state.showroom || '',
+        date:        state.date || '',
+        time:        state.slot || '',
+        name:        state.name || '',
+        phone:       state.phone ? state.phoneCode + ' ' + state.phone : '',
+        notes:       state.notes || '',
+        language:    bookingLang,
+        submittedAt: new Date().toISOString()
+      });
+    }
+
+    [confirmBtn, emailBtn].forEach(btn=>{
+      if(!btn) return;
+      btn.addEventListener('click', function(e){
+        if(btn.classList.contains('is-disabled')){ e.preventDefault(); return; }
+        recordBooking();
+      });
+    });
+
+    renderBrands(); renderShowrooms(); renderDates(); renderSlots(); renderSummary();
+  }
+
+  /* ---------------- Room visualizer (room.html) ----------------
+     Photo-based, not tracked AR: the visitor supplies a room photo (camera or
+     library), the piece is composited onto it on a canvas, and they can move,
+     scale, rotate and perspective-tilt it, then download the result.
+     Everything stays on the device — no upload.
+
+     Robustness notes (these were real failure modes, not hypotheticals):
+       * If a product photo is missing, we fall back to rendering the piece's
+         SVG motif as the rug, so the tool works before any photography exists.
+       * The controls are always visible and simply disabled until a room photo
+         is loaded, rather than hidden — a half-failed load used to leave the
+         panel empty with no explanation.
+       * Download uses toBlob + object URL and reports tainted-canvas failures
+         (which happen when the page is opened over file:// instead of http)
+         instead of silently doing nothing. */
+  function renderRoomVisualizer(config, root){
+    root = root || document;
+    const lang = root.getAttribute('data-lang') || 'en';
+    const i18n = config.i18n || {};
+    const D = window.HeritageData;
+
+    const canvas = root.querySelector('[data-role="room-canvas"]');
+    if(!canvas || !canvas.getContext) return;
+    const ctx = canvas.getContext('2d');
+
+    const fileInput  = root.querySelector('[data-role="room-file"]');
+    const dropZone   = root.querySelector('[data-role="room-drop"]');
+    const rugSelect  = root.querySelector('[data-role="room-rug"]');
+    const stageWrap  = root.querySelector('[data-role="room-stage"]');
+    const controls   = root.querySelector('[data-role="room-controls"]');
+    const dlBtn      = root.querySelector('[data-role="room-download"]');
+    const resetBtn   = root.querySelector('[data-role="room-reset"]');
+    const changeBtn  = root.querySelector('[data-role="room-change"]');
+    const statusEl   = root.querySelector('[data-role="room-status"]');
+
+    const opacInput  = root.querySelector('[data-role="room-opacity"]');
+
+    const RW = window.HeritageRoomWarp;
+
+    const compareInput = root.querySelector('[data-role="room-compare"]');
+    const blendInput   = root.querySelector('[data-role="room-blend"]');
+    const samplesEl    = root.querySelector('[data-role="room-samples"]');
+
+    // `corners` replaces the old scale/rot/persp trio: the rug's four floor
+    // corners in canvas pixels, dragged directly by the user.
+    const DEFAULTS = { scale:0.55, rot:0, opacity:1, blend:0.55, shadow:0.6, compare:1 };
+    const view = Object.assign({ room:null, rug:null, corners:null, showHandles:true }, DEFAULTS);
+
+    function say(msg, kind){
+      if(!statusEl) return;
+      statusEl.textContent = msg || '';
+      statusEl.className = 'room-status' + (kind ? ' ' + kind : '');
+    }
+
+    // Controls stay visible at all times; they are only disabled until there is
+    // a room photo to composite onto, so the panel is never mysteriously empty.
+    function setEnabled(on){
+      if(controls){
+        controls.hidden = false;
+        controls.classList.toggle('is-locked', !on);
+        controls.querySelectorAll('input,button,a').forEach(el=>{
+          if(on){ el.removeAttribute('aria-disabled'); }
+          else { el.setAttribute('aria-disabled','true'); }
+        });
+      }
+    }
+
+    function loadImage(src){
+      return new Promise((res, rej)=>{
+        const im = new Image();
+        im.onload = ()=>res(im);
+        im.onerror = ()=>rej(new Error('load failed: '+src));
+        im.src = src;
+      });
+    }
+
+    // The piece's own SVG motif, used when no photograph is available.
+    function motifImage(product){
+      const color = product.color === 'ivory' ? '#B7CC33' : '#C9DC5E';
+      const svg = motifSVG(product.motif, color);
+      return loadImage('data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg));
+    }
+
+    function loadRug(handle){
+      if(!D) return Promise.reject(new Error('no catalog'));
+      const p = D.find(handle, lang) || D.find(handle, 'en');
+      if(!p) return Promise.reject(new Error('unknown handle'));
+      const imgs = resolveImages(p, 'products');
+      // try each photo in turn, then fall back to the motif so the tool always works
+      let chain = Promise.reject(new Error('start'));
+      imgs.forEach(src=>{ chain = chain.catch(()=>loadImage(src)); });
+      return chain
+        .then(img=>({img:img, fallback:false}))
+        .catch(()=>motifImage(p).then(img=>({img:img, fallback:true})));
+    }
+
+    /* ---------------- warped, blended rug rendering ----------------
+       Two changes from the original:
+       1. The rug is mapped through a homography onto four draggable corners,
+          so it follows the real floor instead of being squashed vertically.
+       2. It is composited partly with 'multiply', which lets the floor's own
+          shadows and highlights fall across it. Without that it reads as a
+          sticker pasted over the photo. */
+    const layer = document.createElement('canvas');
+    const lctx = layer.getContext('2d');
+
+    function drawWarpedRug(target, alpha){
+      if(!view.rug || !view.corners) return;
+      const H = RW.unitSquareToQuad(view.corners[0], view.corners[1], view.corners[2], view.corners[3]);
+      if(!H || !RW.isConvex(view.corners)) return;
+
+      const img = view.rug;
+      const iw = img.naturalWidth || img.width || 1;
+      const ih = img.naturalHeight || img.height || 1;
+
+      // Subdivision: each cell is drawn as two affine triangles, which is an
+      // approximation of the projective map. More cells = less error but more
+      // draw calls; 14 is indistinguishable from exact at these sizes while
+      // staying smooth to drag on a phone.
+      const N = 14;
+      target.save();
+      target.globalAlpha = alpha;
+      for(let i=0;i<N;i++){
+        for(let j=0;j<N;j++){
+          const u0=i/N, u1=(i+1)/N, v0=j/N, v1=(j+1)/N;
+          const p00=RW.applyHomography(H,u0,v0), p10=RW.applyHomography(H,u1,v0),
+                p11=RW.applyHomography(H,u1,v1), p01=RW.applyHomography(H,u0,v1);
+          const s00={x:u0*iw,y:v0*ih}, s10={x:u1*iw,y:v0*ih},
+                s11={x:u1*iw,y:v1*ih}, s01={x:u0*iw,y:v1*ih};
+          drawTriangle(target, img, s00,s10,s11, p00,p10,p11);
+          drawTriangle(target, img, s00,s11,s01, p00,p11,p01);
+        }
+      }
+      target.restore();
+    }
+
+    /* Draws one texture-mapped triangle by solving the affine transform that
+       carries the source triangle onto the destination, then clipping to it.
+       The 0.5px outset closes the hairline seams that otherwise appear
+       between adjacent triangles. */
+    function drawTriangle(c, img, s0, s1, s2, d0, d1, d2){
+      const den = s0.x*(s2.y-s1.y) - s1.x*s2.y + s2.x*s1.y + (s1.x-s2.x)*s0.y;
+      if(Math.abs(den) < 1e-9) return;
+      const m11 = -(s0.y*(d2.x-d1.x) - s1.y*d2.x + s2.y*d1.x + (s1.y-s2.y)*d0.x)/den;
+      const m12 =  (s1.y*d2.y + s0.y*(d1.y-d2.y) - s2.y*d1.y + (s2.y-s1.y)*d0.y)/den;
+      const m21 =  (s0.x*(d2.x-d1.x) - s1.x*d2.x + s2.x*d1.x + (s1.x-s2.x)*d0.x)/den;
+      const m22 = -(s1.x*d2.y + s0.x*(d1.y-d2.y) - s2.x*d1.y + (s2.x-s1.x)*d0.y)/den;
+      const dx  =  (s0.x*(s2.y*d1.x - s1.y*d2.x) + s0.y*(s1.x*d2.x - s2.x*d1.x)
+                    + (s2.x*s1.y - s1.x*s2.y)*d0.x)/den;
+      const dy  =  (s0.x*(s2.y*d1.y - s1.y*d2.y) + s0.y*(s1.x*d2.y - s2.x*d1.y)
+                    + (s2.x*s1.y - s1.x*s2.y)*d0.y)/den;
+
+      c.save();
+      c.beginPath();
+      const cx=(d0.x+d1.x+d2.x)/3, cy=(d0.y+d1.y+d2.y)/3;
+      const out=(p)=>{ const l=Math.hypot(p.x-cx,p.y-cy)||1; return { x:p.x+(p.x-cx)/l*0.5, y:p.y+(p.y-cy)/l*0.5 }; };
+      const o0=out(d0), o1=out(d1), o2=out(d2);
+      c.moveTo(o0.x,o0.y); c.lineTo(o1.x,o1.y); c.lineTo(o2.x,o2.y); c.closePath();
+      c.clip();
+      c.transform(m11, m12, m21, m22, dx, dy);
+      c.drawImage(img, 0, 0);
+      c.restore();
+    }
+
+    function draw(){
+      const W = canvas.width, H = canvas.height;
+      ctx.clearRect(0,0,W,H);
+      if(view.room) ctx.drawImage(view.room, 0, 0, W, H);
+      if(!view.rug || !view.corners) return;
+
+      if(layer.width !== W || layer.height !== H){ layer.width = W; layer.height = H; }
+      lctx.clearRect(0,0,W,H);
+      drawWarpedRug(lctx, 1);
+
+      // compare wipe: only reveal the rug to the right of the split
+      const split = Math.round(W * view.compare);
+      ctx.save();
+      if(view.compare < 1){
+        ctx.beginPath();
+        ctx.rect(0, 0, split, H);
+        ctx.clip();
+      }
+
+      // contact shadow, so the rug sits on the floor rather than floating
+      if(view.shadow > 0){
+        ctx.save();
+        ctx.globalAlpha = 0.30 * view.shadow;
+        ctx.filter = 'blur(' + Math.max(2, W*0.012) + 'px)';
+        ctx.fillStyle = '#000';
+        ctx.beginPath();
+        const c = view.corners;
+        ctx.moveTo(c[0].x, c[0].y+2); ctx.lineTo(c[1].x, c[1].y+2);
+        ctx.lineTo(c[2].x, c[2].y+4); ctx.lineTo(c[3].x, c[3].y+4);
+        ctx.closePath(); ctx.fill();
+        ctx.restore();
+      }
+
+      // normal pass keeps the rug's true colour; multiply pass picks up the
+      // floor's light. `blend` slides between "vivid" and "photographic".
+      const base = view.opacity;
+      ctx.globalAlpha = base * (1 - 0.45 * view.blend);
+      ctx.drawImage(layer, 0, 0);
+      if(view.blend > 0){
+        ctx.globalCompositeOperation = 'multiply';
+        ctx.globalAlpha = base * view.blend;
+        ctx.drawImage(layer, 0, 0);
+        ctx.globalCompositeOperation = 'source-over';
+      }
+      ctx.restore();
+
+      if(view.compare < 1){
+        ctx.save();
+        ctx.strokeStyle = '#B7CC33'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(split, 0); ctx.lineTo(split, H); ctx.stroke();
+        ctx.restore();
+      }
+      drawHandles();
+    }
+
+    function drawHandles(){
+      if(!view.showHandles || !view.corners || view.compare < 1) return;
+      const c = view.corners;
+      ctx.save();
+      ctx.strokeStyle = 'rgba(183,204,51,0.9)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6,5]);
+      ctx.beginPath();
+      ctx.moveTo(c[0].x,c[0].y);
+      for(let i=1;i<4;i++) ctx.lineTo(c[i].x,c[i].y);
+      ctx.closePath(); ctx.stroke();
+      ctx.setLineDash([]);
+      c.forEach(p=>{
+        ctx.beginPath(); ctx.arc(p.x, p.y, 9, 0, Math.PI*2);
+        ctx.fillStyle = '#B7CC33'; ctx.fill();
+        ctx.lineWidth = 2; ctx.strokeStyle = '#2F2D2E'; ctx.stroke();
+      });
+      ctx.restore();
+    }
+
+    function fitCanvasTo(img){
+      const maxW = 1200;
+      const w = Math.min(img.naturalWidth || maxW, maxW);
+      const h = Math.round(w * (img.naturalHeight || 800) / (img.naturalWidth || 1200));
+      canvas.width = w; canvas.height = h;
+    }
+
+    function refreshRug(){
+      if(!rugSelect) return Promise.resolve();
+      return loadRug(rugSelect.value).then(r=>{
+        view.rug = r.img;
+        if(r.fallback) say(i18n.motifFallback || 'Showing the pattern outline — no photograph uploaded for this piece yet.', 'warn');
+        else if(view.room) say('');
+        draw();
+      }).catch(()=>{
+        view.rug = null;
+        say(i18n.rugFailed || 'Could not load that piece.', 'warn');
+      });
+    }
+
+    function useRoomFile(file){
+      if(!file){ return; }
+      if(!file.type || !file.type.startsWith('image/')){
+        say(i18n.notImage || 'That file is not an image — please choose a photo.', 'warn');
+        return;
+      }
+      say(i18n.loading || 'Loading your photo…');
+      const reader = new FileReader();
+      reader.onerror = ()=>say(i18n.readFailed || 'Could not read that file.', 'warn');
+      reader.onload = function(e){
+        loadImage(e.target.result).then(applyRoomImage).catch(()=>{
+          say(i18n.photoFailed || 'That photo could not be opened. Try another image.', 'warn');
+        });
+      };
+      reader.readAsDataURL(file);
+    }
+
+    /* ---- sample rooms ----
+       Most visitors never upload a photo — the upload is the biggest drop-off
+       in this tool. These are real Heritage project interiors already in the
+       repo, so someone can try a rug in a room within one click of landing.
+       A thumbnail whose file is missing removes itself rather than showing a
+       broken image. */
+    const SAMPLE_ROOMS = [
+      { src:'Assets/projects/villa-majlis-jeddah.jpg',    label:'Majlis',        label_ar:'مجلس' },
+      { src:'Assets/projects/family-villa-riyadh.jpg',    label:'Living Room',   label_ar:'غرفة معيشة' },
+      { src:'Assets/projects/palace-reception-hall.jpg',  label:'Reception',     label_ar:'قاعة استقبال' },
+      { src:'Assets/projects/royal-guest-residence.jpg',  label:'Guest Room',    label_ar:'غرفة ضيوف' },
+      { src:'Assets/projects/boutique-hotel-riyadh.jpg',  label:'Hotel Suite',   label_ar:'جناح فندقي' },
+      { src:'Assets/projects/hotel-lobby-jeddah.jpg',     label:'Lobby',         label_ar:'بهو' }
+    ];
+
+    function applyRoomImage(img){
+      view.room = img;
+      view.corners = null;              // re-fit the rug to the new photo
+      fitCanvasTo(img);
+      if(stageWrap) stageWrap.hidden = false;
+      if(dropZone) dropZone.classList.add('has-room');
+      setEnabled(true);
+      say('');
+      return refreshRug().then(()=>{ ensureCorners(); draw(); });
+    }
+
+    function buildSamples(){
+      if(!samplesEl) return;
+      samplesEl.innerHTML = SAMPLE_ROOMS.map((s,i)=>
+        '<button type="button" class="room-sample" data-sample="'+i+'">'+
+          '<img src="'+s.src+'" alt="" loading="lazy">'+
+          '<span>'+(lang==='ar' ? s.label_ar : s.label)+'</span>'+
+        '</button>').join('');
+      samplesEl.querySelectorAll('img').forEach(img=>{
+        img.addEventListener('error', function(){
+          const b = img.closest('.room-sample');
+          if(b) b.remove();
+          if(!samplesEl.querySelector('.room-sample')) samplesEl.hidden = true;
+        }, {once:true});
+      });
+      samplesEl.addEventListener('click', function(e){
+        const b = e.target.closest('[data-sample]');
+        if(!b) return;
+        const s = SAMPLE_ROOMS[parseInt(b.dataset.sample,10)];
+        if(!s) return;
+        say(i18n.loading || 'Loading photo…');
+        loadImage(s.src)
+          .then(applyRoomImage)
+          .catch(()=> say(i18n.photoFailed || 'That photo could not be opened.', 'warn'));
+        samplesEl.querySelectorAll('.room-sample').forEach(x=>x.classList.toggle('active', x===b));
+      });
+    }
+    buildSamples();
+
+    if(dropZone && fileInput){
+      dropZone.addEventListener('click', function(e){
+        // the file input lives inside the drop zone; without this guard its own
+        // click bubbles back here and re-triggers the picker
+        if(e.target === fileInput) return;
+        fileInput.click();
+      });
+      ['dragover','dragleave','drop'].forEach(ev=>{
+        dropZone.addEventListener(ev, function(e){
+          e.preventDefault();
+          dropZone.classList.toggle('dragover', ev==='dragover');
+        });
+      });
+      dropZone.addEventListener('drop', e=>useRoomFile(e.dataTransfer.files[0]));
+      fileInput.addEventListener('click', e=>e.stopPropagation());
+      fileInput.addEventListener('change', function(){ useRoomFile(fileInput.files[0]); });
+    }
+    if(changeBtn && fileInput){
+      changeBtn.addEventListener('click', function(){ fileInput.click(); });
+    }
+    if(rugSelect) rugSelect.addEventListener('change', refreshRug);
+
+    const bind = (el, key, transform)=>{
+      if(!el) return;
+      const handler = function(){
+        view[key] = transform ? transform(el.value) : parseFloat(el.value);
+        draw();
+      };
+      el.addEventListener('input', handler);
+      el.addEventListener('change', handler); // some mobile browsers only fire change
+    };
+    bind(opacInput,  'opacity', v=>parseFloat(v)/100);
+    bind(blendInput, 'blend',   v=>parseFloat(v)/100);
+    bind(compareInput, 'compare', v=>parseFloat(v)/100);
+
+    /* ---- Direct manipulation on the canvas ----
+       Drag a corner handle : reshape the rug to match the floor
+       Drag inside the rug  : slide the whole rug around
+       Two fingers / wheel  : resize, and twist to rotate
+       Corner dragging is the point of the rewrite — the old "floor angle"
+       slider asked the user to guess a number; now they just pull the
+       corners onto the floor they can see. */
+    const pointers = new Map();
+    let gesture = null;
+    let dragCorner = -1;
+    let dragAll = false;
+    let dragFrom = null;
+
+    function canvasPoint(e){
+      const r = canvas.getBoundingClientRect();
+      if(!r.width || !r.height) return null;
+      return { x:(e.clientX - r.left) / r.width * canvas.width,
+               y:(e.clientY - r.top)  / r.height * canvas.height };
+    }
+
+    function handleRadius(){
+      // handles must stay comfortably tappable regardless of canvas scale
+      const r = canvas.getBoundingClientRect();
+      const cssToCanvas = r.width ? canvas.width / r.width : 1;
+      return Math.max(14, 22 * cssToCanvas);
+    }
+
+    function ensureCorners(){
+      if(view.corners || !view.rug) return;
+      const W = canvas.width, H = canvas.height;
+      const ratio = (view.rug.naturalHeight || 1) / (view.rug.naturalWidth || 1);
+      const w = W * view.scale;
+      view.corners = RW.defaultCorners(W*0.5, H*0.68, w, w*ratio*0.75);
+    }
+
+    function commitCorners(next){
+      if(!RW.isConvex(next)) return;                   // refuse a bow-tie
+      view.corners = RW.clampCornersToCanvas(next, canvas.width, canvas.height, 60);
+      draw();
+    }
+
+    canvas.addEventListener('pointerdown', function(e){
+      if(!view.rug || !view.room) return;
+      canvas.setPointerCapture && canvas.setPointerCapture(e.pointerId);
+      pointers.set(e.pointerId, e);
+      const p = canvasPoint(e); if(!p) return;
+      ensureCorners();
+      if(pointers.size === 1){
+        dragCorner = RW.hitCorner(view.corners, p.x, p.y, handleRadius());
+        dragAll = dragCorner === -1 && RW.pointInQuad(view.corners, p.x, p.y);
+        dragFrom = p;
+        view.showHandles = true;
+      }else if(pointers.size === 2){
+        dragCorner = -1; dragAll = false;
+        gesture = twoFingerState();
+      }
+    });
+
+    canvas.addEventListener('pointermove', function(e){
+      if(!pointers.has(e.pointerId)) return;
+      pointers.set(e.pointerId, e);
+      if(!view.rug || !view.corners) return;
+      const p = canvasPoint(e); if(!p) return;
+
+      if(pointers.size >= 2 && gesture){
+        const now = twoFingerState();
+        if(!now) return;
+        const factor = now.dist / (gesture.dist || 1);
+        let next = RW.scaleCorners(gesture.corners, Math.min(3, Math.max(0.3, factor)));
+        next = RW.rotateCorners(next, now.angle - gesture.angle);
+        commitCorners(next);
+        return;
+      }
+      e.preventDefault && e.preventDefault();
+      if(dragCorner > -1){
+        const next = view.corners.map((c,i)=> i===dragCorner ? { x:p.x, y:p.y } : c);
+        commitCorners(next);
+      }else if(dragAll && dragFrom){
+        const next = RW.translateCorners(view.corners, p.x - dragFrom.x, p.y - dragFrom.y);
+        dragFrom = p;
+        commitCorners(next);
+      }
+    });
+
+    function twoFingerState(){
+      const pts = Array.from(pointers.values());
+      const a = pts[0], b = pts[1];
+      if(!a || !b) return null;
+      const dx = b.clientX - a.clientX, dy = b.clientY - a.clientY;
+      return { dist: Math.hypot(dx, dy) || 1, angle: Math.atan2(dy, dx),
+               corners: view.corners.slice() };
+    }
+
+    function endPointer(e){
+      pointers.delete(e.pointerId);
+      if(pointers.size < 2) gesture = null;
+      if(pointers.size === 0){ dragCorner = -1; dragAll = false; dragFrom = null; }
+    }
+    canvas.addEventListener('pointerup', endPointer);
+    canvas.addEventListener('pointercancel', endPointer);
+    canvas.addEventListener('pointerleave', function(e){ if(pointers.has(e.pointerId)) endPointer(e); });
+
+    canvas.addEventListener('wheel', function(e){
+      if(!view.rug || !view.room) return;
+      e.preventDefault();
+      ensureCorners();
+      commitCorners(RW.scaleCorners(view.corners, e.deltaY > 0 ? 0.96 : 1.04));
+    }, {passive:false});
+
+    function endPointer(e){
+      pointers.delete(e.pointerId);
+      if(pointers.size < 2) gesture = null;
+      if(pointers.size === 0) dragging = false;
+      if(pointers.size === 1){
+        // lifting one finger of a pinch shouldn't teleport the rug: resume dragging
+        // from wherever the remaining finger is, not from a stale position
+        dragging = true;
+      }
+    }
+    canvas.addEventListener('pointerup', endPointer);
+    canvas.addEventListener('pointercancel', endPointer);
+    canvas.addEventListener('pointerleave', function(e){ if(pointers.has(e.pointerId)) endPointer(e); });
+
+    if(resetBtn){
+      resetBtn.addEventListener('click', function(){
+        Object.assign(view, DEFAULTS);
+        view.corners = null;            // rebuilt on the next draw
+        ensureCorners();
+        if(opacInput) opacInput.value = 100;
+        if(blendInput) blendInput.value = 55;
+        if(compareInput) compareInput.value = 100;
+        draw();
+      });
+    }
+
+    if(dlBtn){
+      dlBtn.addEventListener('click', function(e){
+        e.preventDefault();
+        if(!view.room){ say(i18n.needPhoto || 'Add a room photo first.', 'warn'); return; }
+        const finish = (url)=>{
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'heritage-room-preview.jpg';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          say(i18n.downloaded || 'Preview saved.', 'ok');
+        };
+        try{
+          if(canvas.toBlob){
+            canvas.toBlob(function(blob){
+              if(!blob){ say(i18n.downloadFailed || 'Could not export the image.', 'warn'); return; }
+              const url = URL.createObjectURL(blob);
+              finish(url);
+              setTimeout(()=>URL.revokeObjectURL(url), 10000);
+            }, 'image/jpeg', 0.92);
+          } else {
+            finish(canvas.toDataURL('image/jpeg', 0.92));
+          }
+        }catch(err){
+          // SecurityError here means the canvas is tainted — almost always because
+          // the page was opened from the file system rather than served over http.
+          say(i18n.taintedCanvas || 'Export blocked by the browser. Open the site over http(s) rather than as a local file, then try again.', 'warn');
+        }
+      });
+    }
+
+    // populate the piece chooser from the shared catalog
+    if(rugSelect && D){
+      const list = (D.products[lang] || D.products.en)
+        .filter(p=>p.category.indexOf('accessories')===-1 && p.category.indexOf('furniture')===-1);
+      rugSelect.innerHTML = list.map(p=>'<option value="'+p.handle+'">'+p.name+'</option>').join('');
+      const preset = new URLSearchParams(window.location.search).get('handle');
+      if(preset && list.some(p=>p.handle===preset)) rugSelect.value = preset;
+    }
+
+    // On touch devices tell people to use the photo directly — the sliders stay as a
+    // fine-tune fallback, but pinch/twist on the image is the primary interaction.
+    const coarsePointer = window.matchMedia && window.matchMedia('(hover: none)').matches;
+    if(coarsePointer){
+      const note = root.querySelector('.room-note');
+      if(note){
+        note.textContent = i18n.touchHint || (lang === 'ar'
+          ? 'اسحب بإصبع واحد لتحريك السجادة، وقرّب أو باعد بإصبعين لتغيير المقاس، ولفّهما للدوران، واسحبهما لأعلى أو لأسفل لضبط زاوية الأرضية. هذه معاينة بصرية وليست قياسًا دقيقًا.'
+          : 'Drag with one finger to move the rug. Pinch with two fingers to resize, twist to rotate, and slide two fingers up or down to set the floor angle. This is a visual guide, not a measured fit.');
+      }
+    }
+
+    setEnabled(false);
+    say(i18n.startHint || '');
+    refreshRug();
+  }
+
+  /* ---------------- Scroll-reveal safety net ----------------
+     .reveal starts at opacity:0 and is switched on by an IntersectionObserver.
+     Two situations break that and leave real content invisible:
+       1. Content that is already below the fold on a small screen — on phones the
+          product grid starts under the viewport, so nothing reported an
+          intersection and the grid stayed at opacity 0 even though every card
+          was in the DOM. (This was the "products only appear after I touch a
+          filter" bug — interacting forced a layout change that woke the observer.)
+       2. Anything inside the hidden language block, which can never intersect
+          at all until that block is shown.
+     revealInView() force-reveals anything currently on screen, and revealNow()
+     is used for grids we render ourselves, which must never be hidden. -------- */
+  function revealNow(el){
+    if(el) el.classList.add('is-visible');
+  }
+
+  function revealInView(scope){
+    scope = scope || document;
+    const h = window.innerHeight || 800;
+    scope.querySelectorAll('.reveal').forEach(el=>{
+      if(el.classList.contains('is-visible')) return;
+      let top = 0;
+      try { top = el.getBoundingClientRect().top; } catch(e) { top = 0; }
+      // generous margin: better a missed animation than invisible content
+      if(top < h * 1.5) el.classList.add('is-visible');
+    });
+  }
+
+  /* ---------------- Projects page (projects.html) ----------------
+     Content comes from js/projects-data.js so the English and Arabic copy sit
+     side by side in one file. Rendered per language block like every other page. */
+  /* ---------------- Shared video header (Projects + Brands pages) ----------------
+     embed > mp4 > poster > motif fallback, in that order. One implementation so
+     both pages behave identically and stay in sync if this logic ever changes. */
+  /* ---------------- Shared video header (Projects + Brands pages) ----------------
+     embed > videos[] playlist > single src > poster > motif, in that priority.
+     A `videos` array plays each clip through in sequence, advancing on 'ended'
+     and looping back to the first once the list is exhausted — one clip just
+     loops continuously as before (unchanged behaviour for existing configs
+     that still use the plain src/poster shape, e.g. js/projects-data.js).
+     If a clip fails to load, its own poster stands in briefly and playback
+     advances to the next clip; if everything in the list fails, the arch
+     motif shows, exactly as the single-video fallback always has. */
+  function renderVideoHeader(videoWrap, video, titleForEmbed){
+    if(!videoWrap) return;
+    const v = video || {};
+    const list = (v.videos && v.videos.length) ? v.videos : (v.src ? [{src:v.src, poster:v.poster}] : []);
+
+    if(v.embed){
+      videoWrap.innerHTML = '<iframe src="'+v.embed+'" title="'+(titleForEmbed||'')+'" loading="lazy" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>';
+      return;
+    }
+    if(!list.length){
+      videoWrap.innerHTML = motifSVG('arch', '#C9DC5E');
+      return;
+    }
+
+    let idx = 0;
+    function showMotif(){ videoWrap.innerHTML = motifSVG('arch', '#C9DC5E'); }
+    function advance(){
+      idx += 1;
+      if(idx >= list.length){ showMotif(); return; }
+      playCurrent();
+    }
+    function playCurrent(){
+      const entry = list[idx];
+      if(!entry || !entry.src){ advance(); return; }
+      const multi = list.length > 1;
+      videoWrap.innerHTML =
+        '<video autoplay muted'+(multi?'':' loop')+' playsinline preload="metadata"'+(entry.poster?' poster="'+entry.poster+'"':'')+'>'+
+        '<source src="'+entry.src+'" type="video/mp4"></video>';
+      const vidEl = videoWrap.querySelector('video');
+      const srcEl = vidEl.querySelector('source');
+      // with more than one clip, move to the next once this one finishes
+      // playing through — a single clip keeps looping itself as it always has
+      if(multi) vidEl.addEventListener('ended', function(){ idx = (idx+1) % list.length; playCurrent(); });
+      const onErr = function(){
+        if(!entry.poster){ advance(); return; }
+        videoWrap.innerHTML = '<img class="pv-video-poster" src="'+entry.poster+'" alt="">';
+        videoWrap.querySelector('img').addEventListener('error', advance, {once:true});
+      };
+      vidEl.addEventListener('error', onErr, {once:true});
+      srcEl.addEventListener('error', onErr, {once:true});
+    }
+
+    /* Lazy start. This function runs once per language block, and the
+       inactive block is hidden — but an `autoplay` video fetches even while
+       hidden, so every page with a header video was streaming a second copy
+       of a 20–60 MB file nobody could see. The video is now only created once
+       its container is actually visible. The block on screen intersects
+       immediately and starts as before; the hidden one waits until the
+       visitor switches language, then starts on its own. */
+    if('IntersectionObserver' in window){
+      const io = new IntersectionObserver(function(entries){
+        if(entries.some(e => e.isIntersecting)){
+          io.disconnect();
+          playCurrent();
+        }
+      }, { rootMargin:'200px 0px' });
+      io.observe(videoWrap);
+    } else {
+      playCurrent();   // very old browsers: previous behaviour
+    }
+  }
+
+  function renderProjectsPage(config, root){
+    root = root || document;
+    const lang = root.getAttribute('data-lang') || 'en';
+    const P = window.HeritageProjects;
+    if(!P) return;
+    const C = P[lang] || P.en;
+
+    renderVideoHeader(root.querySelector('[data-role="pv-video"]'), P.video, C.hero.title);
+
+    const setText = (role, txt) => { const el = root.querySelector('[data-role="'+role+'"]'); if(el) el.textContent = txt; };
+    const head = (prefix, obj) => {
+      setText(prefix+'-kicker', obj.kicker);
+      setText(prefix+'-title', obj.title);
+      setText(prefix+'-lead', obj.lead);
+    };
+    head('pv-hero', C.hero);
+    head('pv-commercial', C.commercialHead);
+    head('pv-intro', C.introHead);
+    head('pv-gallery', C.galleryHead);
+    head('pv-process', C.processHead);
+    head('pv-form', C.formHead);
+
+    // ---- commercial solutions (same set as the homepage) ----
+    const cg = root.querySelector('[data-role="pv-commercial-grid"]');
+    if(cg) cg.innerHTML = C.commercial.map(c=>{
+      const inner = '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.3">'+ICONS[c.icon]+'</svg><h4>'+c.t+'</h4><p>'+c.d+'</p>';
+      // `target` is a solution slug; the language suffix is added here so the anchor
+      // always points at the block in the language currently being shown
+      const href = c.href || (c.target ? '#solution-'+c.target+'-'+lang : '');
+      return href
+        ? '<a class="commercial-card is-link" href="'+href+'">'+inner+'</a>'
+        : '<div class="commercial-card">'+inner+'</div>';
+    }).join('');
+
+    // ---- the seven solution blocks ----
+    const list = root.querySelector('[data-role="pv-solutions"]');
+    if(list){
+      list.innerHTML = C.solutions.map((s, i)=>{
+        const imgs = (Array.isArray(s.images) && s.images.length) ? s.images : [
+          'Assets/projects/'+s.slug+'.jpg',
+          'Assets/projects/'+s.slug+'-2.jpg',
+          'Assets/projects/'+s.slug+'-3.jpg'
+        ];
+        const panel = (key, items)=>{
+          if(!items || !items.length) return '';
+          return '<div class="acc">'+
+            '<button type="button" class="acc-head" aria-expanded="false">'+
+              '<span>'+C.panelLabels[key]+'</span><span class="acc-icon" aria-hidden="true"></span>'+
+            '</button>'+
+            '<div class="acc-body"><ul>'+items.map(x=>'<li>'+x+'</li>').join('')+'</ul></div>'+
+          '</div>';
+        };
+        return '<article class="solution'+(i%2 ? ' is-reversed':'')+'" id="solution-'+s.slug+'-'+lang+'">'+
+          '<div class="solution-media"><div class="motif">'+motifSVG(s.motif, '#C9DC5E')+buildCarouselMarkup(imgs)+'</div>'+
+            '<div class="solution-project">'+s.project+'</div></div>'+
+          '<div class="solution-body">'+
+            '<h3>'+s.title+'</h3>'+
+            '<p class="solution-text">'+s.body+'</p>'+
+            '<div class="acc-group">'+
+              panel('usage', s.usage)+
+              panel('characteristics', s.characteristics)+
+              panel('availability', s.availability)+
+            '</div>'+
+          '</div>'+
+        '</article>';
+      }).join('');
+
+      // accordions — one handler for the whole list
+      list.addEventListener('click', function(e){
+        const btn = e.target.closest('.acc-head');
+        if(!btn) return;
+        const open = btn.getAttribute('aria-expanded') === 'true';
+        btn.setAttribute('aria-expanded', open ? 'false' : 'true');
+        btn.parentNode.classList.toggle('is-open', !open);
+      });
+      initCarousels(list);
+    }
+
+    // ---- full-width featured gallery ----
+    const gal = root.querySelector('[data-role="pv-gallery-track"]');
+    if(gal){
+      const slides = C.solutions.map(s=>({slug:s.slug, label:s.project}));
+      gal.innerHTML = slides.map((s,i)=>
+        '<div class="pv-slide'+(i===0?' active':'')+'" data-index="'+i+'">'+
+          motifSVG('medallion','#C9DC5E')+
+          '<img src="Assets/projects/'+s.slug+'.jpg" alt="'+s.label+'" loading="lazy" decoding="async">'+
+          '<div class="pv-slide-label">'+s.label+'</div>'+
+        '</div>'
+      ).join('');
+      const dots = root.querySelector('[data-role="pv-gallery-dots"]');
+      if(dots) dots.innerHTML = slides.map((_,i)=>'<span class="carousel-dot'+(i===0?' active':'')+'" data-index="'+i+'"></span>').join('');
+      let gi = 0;
+      const show = (i)=>{
+        gi = (i + slides.length) % slides.length;
+        gal.querySelectorAll('.pv-slide').forEach((el,idx)=>el.classList.toggle('active', idx===gi));
+        if(dots) dots.querySelectorAll('.carousel-dot').forEach((el,idx)=>el.classList.toggle('active', idx===gi));
+      };
+      gal.querySelectorAll('.pv-slide img').forEach(img=>{
+        img.addEventListener('error', function(){ img.remove(); }, {once:true});
+      });
+      const prev = root.querySelector('[data-role="pv-gallery-prev"]');
+      const next = root.querySelector('[data-role="pv-gallery-next"]');
+      if(prev) prev.addEventListener('click', ()=>show(gi-1));
+      if(next) next.addEventListener('click', ()=>show(gi+1));
+      if(dots) dots.addEventListener('click', function(e){
+        const d = e.target.closest('.carousel-dot');
+        if(d) show(parseInt(d.dataset.index,10));
+      });
+      if(!reducedMotion){
+        let timer = setInterval(()=>show(gi+1), 5200);
+        gal.addEventListener('mouseenter', ()=>clearInterval(timer));
+        gal.addEventListener('mouseleave', ()=>{ timer = setInterval(()=>show(gi+1), 5200); });
+      }
+    }
+
+    // ---- end-to-end process ----
+    const proc = root.querySelector('[data-role="pv-process"]');
+    if(proc) proc.innerHTML = C.process.map(p=>
+      '<div class="process-step"><div class="process-num">'+p.n+'</div><h4>'+p.t+'</h4><p>'+p.d+'</p></div>'
+    ).join('');
+
+    // ---- enquiry form -> WhatsApp / email, same handoff as Book a Visit ----
+    const form = root.querySelector('[data-role="pv-form"]');
+    if(form){
+      const F = C.form;
+      form.innerHTML =
+        '<div class="pv-field"><label>'+F.name+' *</label><input class="field-input" data-f="name"></div>'+
+        '<div class="pv-field"><label>'+F.company+'</label><input class="field-input" data-f="company"></div>'+
+        '<div class="pv-field"><label>'+F.email+'</label><input class="field-input" type="email" data-f="email"></div>'+
+        '<div class="pv-field"><label>'+F.phone+'</label>'+phoneFieldHTML('data-f="phoneCode"', 'data-f="phone"', '+966', '')+'</div>'+
+        '<div class="pv-field"><label>'+F.type+'</label><select class="field-input" data-f="type">'+
+          '<option value=""></option>'+F.types.map(t=>'<option>'+t+'</option>').join('')+'</select></div>'+
+        '<div class="pv-field"><label>'+F.location+'</label><input class="field-input" data-f="location"></div>'+
+        '<div class="pv-field"><label>'+F.size+'</label><input class="field-input" type="number" min="0" data-f="size"></div>'+
+        '<div class="pv-field"><label>'+F.timeline+'</label><select class="field-input" data-f="timeline">'+
+          '<option value=""></option>'+F.timelines.map(t=>'<option>'+t+'</option>').join('')+'</select></div>'+
+        '<div class="pv-field pv-field-full"><label>'+F.details+'</label>'+
+          '<textarea class="field-input" rows="4" data-f="details" placeholder="'+F.detailsPlaceholder+'"></textarea></div>'+
+        '<div class="pv-field pv-field-full pv-actions">'+
+          '<a class="btn btn-wa is-disabled" data-role="pv-send-wa" href="#" target="_blank" rel="noopener">'+F.submitWa+'</a>'+
+          '<a class="btn btn-outline dark is-disabled" data-role="pv-send-email" href="#">'+F.submitEmail+'</a>'+
+        '</div>'+
+        '<p class="pv-note pv-field-full" data-role="pv-form-note">'+F.note+'</p>';
+
+      const val = (k)=>{ const el = form.querySelector('[data-f="'+k+'"]'); return el ? el.value.trim() : ''; };
+      const waBtn = form.querySelector('[data-role="pv-send-wa"]');
+      const emBtn = form.querySelector('[data-role="pv-send-email"]');
+      const note  = form.querySelector('[data-role="pv-form-note"]');
+
+      function refresh(){
+        updatePhoneHint(form.querySelector('[data-f="phone"]'), lang);
+        const ready = !!(val('name') && isValidPhone(val('phone')));
+        [waBtn, emBtn].forEach(b=>{ if(b) b.classList.toggle('is-disabled', !ready); });
+        note.textContent = ready ? F.note : F.required;
+        if(!ready){
+          if(waBtn) waBtn.setAttribute('href','#');
+          if(emBtn) emBtn.setAttribute('href','#');
+          return;
+        }
+        const rows = [
+          F.name+': '+val('name'),
+          F.company+': '+(val('company')||'-'),
+          F.email+': '+(val('email')||'-'),
+          F.phone+': '+(val('phone') ? val('phoneCode')+' '+val('phone') : '-'),
+          F.type+': '+(val('type')||'-'),
+          F.location+': '+(val('location')||'-'),
+          F.size+': '+(val('size')||'-'),
+          F.timeline+': '+(val('timeline')||'-'),
+          F.details+': '+(val('details')||'-')
+        ].join('\n');
+        const body = F.intro+'\n\n'+rows;
+        if(waBtn) waBtn.setAttribute('href','https://wa.me/966552144855?text='+encodeURIComponent(body));
+        if(emBtn) emBtn.setAttribute('href','mailto:info@heritagecarpet.sa?subject='+encodeURIComponent(F.subject)+'&body='+encodeURIComponent(body));
+      }
+      form.addEventListener('input', refresh);
+      form.addEventListener('change', refresh);
+      [waBtn, emBtn].forEach(b=>{
+        if(b) b.addEventListener('click', function(e){
+          if(b.classList.contains('is-disabled')){ e.preventDefault(); return; }
+          sendToSheet(SHEET_WEBHOOKS.projects, {
+            form:        'projects',
+            name:        val('name'),
+            company:     val('company'),
+            email:       val('email'),
+            phone:       val('phone') ? val('phoneCode')+' '+val('phone') : '',
+            projectType: val('type'),
+            location:    val('location'),
+            sizeSqm:     val('size'),
+            timeline:    val('timeline'),
+            details:     val('details'),
+            language:    lang,
+            submittedAt: new Date().toISOString()
+          });
+        });
+      });
+      refresh();
+    }
+  }
+
+  /* ---------------- Content pages (furniture.html / flooring.html / about.html) ----------------
+     All three share one layout and one renderer; only the data key differs.
+     Copy lives in js/pages-data.js. */
+  function renderContentPage(config, root){
+    root = root || document;
+    const lang = root.getAttribute('data-lang') || 'en';
+    const P = window.HeritagePages;
+    if(!P || !P[config.page]) return;
+    const C = P[config.page][lang] || P[config.page].en;
+
+    const set = (role, txt) => { const el = root.querySelector('[data-role="'+role+'"]'); if(el) el.textContent = txt; };
+    set('cp-kicker', C.kicker);
+    set('cp-title', C.title);
+    set('cp-lead', C.lead);
+    set('cp-intro-title', C.introTitle);
+    set('cp-intro-body', C.introBody);
+    set('cp-feat-title', C.featTitle);
+    set('cp-cta-title', C.ctaTitle);
+    set('cp-cta-body', C.ctaBody);
+
+    // optional: a compact image+text story slider, replacing the old stacked
+    // "about" blocks on pages that supply `storySlides` (currently only
+    // Furniture/Divano) — a single fixed-height section showing one slide at
+    // a time, instead of several full-width blocks stacked one after another
+    // ---- scroll-triggered card stack (image + header + details per card) ----
+    // Pure CSS position:sticky does the actual stacking (each card pins at the
+    // same offset, so the next one visually slides up and covers it as the
+    // page continues to scroll — no scroll-jacking, no animation library).
+    // JS only handles: building the cards, and adding the fade+rise entrance
+    // via the same IntersectionObserver used for .reveal elsewhere on the site.
+    const storySlider = root.querySelector('[data-role="cp-story-slider"]');
+    if(storySlider && C.storySlides && C.storySlides.length){
+      const logoWrap = root.querySelector('[data-role="cp-story-logo"]');
+      if(logoWrap){
+        if(C.storyLogo){
+          logoWrap.innerHTML = '<img src="'+C.storyLogo+'" alt="" loading="lazy" decoding="async">';
+          logoWrap.querySelector('img').addEventListener('error', function(){ logoWrap.style.display = 'none'; }, {once:true});
+        } else {
+          // pages without a single brand logo (e.g. Flooring) shouldn't leave
+          // an empty 40px slot above the stack
+          logoWrap.style.display = 'none';
+        }
+      }
+      const track = storySlider.querySelector('[data-role="cp-story-track"]');
+      const slides = C.storySlides;
+      if(track){
+        const moreLabel = (lang==='ar') ? 'التفاصيل ←' : 'See Details →';
+        track.innerHTML = slides.map((s,i)=>
+          '<article class="stack-card reveal" style="--i:'+i+'">'+
+            '<div class="stack-card-media"><img src="'+s.img+'" alt="" loading="lazy"></div>'+
+            '<div class="stack-card-body"><h3>'+s.t+'</h3><p>'+s.b+'</p>'+
+              (s.href ? '<a class="btn-text stack-card-link" href="'+s.href+'">'+moreLabel+'</a>' : '')+
+            '</div>'+
+          '</article>'
+        ).join('');
+        track.querySelectorAll('img').forEach(img=>{
+          img.addEventListener('error', function(){ img.closest('.stack-card').classList.add('no-media'); img.remove(); }, {once:true});
+        });
+        // no explicit reveal call needed here: these cards exist in the DOM
+        // before DOMContentLoaded fires, so initCommon()'s own IntersectionObserver
+        // picks them up automatically, same as every other .reveal element.
+
+        // Scroll-driven "minimize" effect: position:sticky alone makes each card
+        // pin and get covered abruptly. To make the covered (topmost) card shrink
+        // smoothly as the next one arrives, its scale has to track live scroll
+        // position — that part can't be done in pure CSS. Progress is measured
+        // from the NEXT card's own distance to the sticky offset, so the shrink
+        // is tied to actual position, not a timer — it reads as "minimize on
+        // scroll down" and naturally reverses (grows back) scrolling back up,
+        // rather than a one-way animation that would fight the sticky behaviour.
+        if(slides.length > 1){
+          const STICKY_TOP = 110;
+          let ticking = false;
+          function updateStack(){
+            ticking = false;
+            const cardsNow = track.querySelectorAll('.stack-card');
+            const buffer = Math.min(420, (window.innerHeight || 800) * 0.55);
+            cardsNow.forEach((el, i)=>{
+              const next = cardsNow[i+1];
+              if(!next){ el.style.transform = ''; return; }
+              const nextTop = next.getBoundingClientRect().top;
+              const progress = Math.min(1, Math.max(0, 1 - (nextTop - STICKY_TOP) / buffer));
+              el.style.transform = progress > 0.001 ? 'scale('+(1 - progress * 0.08).toFixed(4)+')' : '';
+            });
+          }
+          function onScroll(){
+            if(!ticking){ window.requestAnimationFrame(updateStack); ticking = true; }
+          }
+          if(reducedMotion){
+            // respect prefers-reduced-motion: keep the structural stack, skip
+            // the continuous scale animation entirely
+          } else {
+            window.addEventListener('scroll', onScroll, {passive:true});
+            window.addEventListener('resize', onScroll, {passive:true});
+            updateStack();
+          }
+        }
+      }
+    }
+
+    // optional: a single service callout (currently Divano's Interior Design)
+    const eliteSection = root.querySelector('[data-role="cp-elite-section"]');
+    if(eliteSection){
+      if(C.elite){
+        eliteSection.hidden = false;
+        const setE = (role, txt) => { const el = root.querySelector('[data-role="'+role+'"]'); if(el) el.textContent = txt; };
+        setE('cp-elite-kicker', C.elite.kicker);
+        setE('cp-elite-title', C.elite.title);
+        setE('cp-elite-body', C.elite.body);
+        const tagsEl = root.querySelector('[data-role="cp-elite-tags"]');
+        if(tagsEl) tagsEl.innerHTML = (C.elite.highlights || []).map(h=>'<span class="bs-highlight">'+h+'</span>').join('');
+      } else {
+        eliteSection.hidden = true;
+      }
+    }
+
+    const serviceSection = root.querySelector('[data-role="cp-service-section"]');
+    if(serviceSection){
+      if(C.service){
+        serviceSection.hidden = false;
+        const setS = (role, txt) => { const el = root.querySelector('[data-role="'+role+'"]'); if(el) el.textContent = txt; };
+        setS('cp-service-title', C.service.title);
+        setS('cp-service-body', C.service.body);
+        const linkEl = root.querySelector('[data-role="cp-service-link"]');
+        if(linkEl){
+          linkEl.textContent = C.service.linkText;
+          linkEl.setAttribute('href', C.service.linkUrl);
+        }
+      } else {
+        serviceSection.hidden = true;
+      }
+    }
+
+    const feats = root.querySelector('[data-role="cp-features"]');
+    if(feats){
+      feats.innerHTML = C.features.map(f=>
+        '<div class="cp-feature"><h4>'+f.t+'</h4><p>'+f.d+'</p></div>'
+      ).join('');
+    }
+
+    // optional: a full product-category directory linking out to a brand's own
+    // store (currently only Furniture/Divano supplies this) — pages without a
+    // `categories` array simply skip this section entirely
+    const catsSection = root.querySelector('[data-role="cp-categories-section"]');
+    if(catsSection){
+      if(C.categories && C.categories.length){
+        catsSection.hidden = false;
+        const set2 = (role, txt) => { const el = root.querySelector('[data-role="'+role+'"]'); if(el) el.textContent = txt; };
+        set2('cp-categories-title', C.categoriesTitle || '');
+        set2('cp-categories-lead', C.categoriesLead || '');
+        const storeBtn = root.querySelector('[data-role="cp-store-link"]');
+        if(storeBtn && C.storeUrl) storeBtn.setAttribute('href', C.storeUrl);
+
+        const grid = root.querySelector('[data-role="cp-categories-grid"]');
+        if(grid){
+          grid.innerHTML = C.categories.map(cat=>{
+            const heading = cat.href
+              ? '<a class="cp-cat-heading" href="'+cat.href+'" target="_blank" rel="noopener">'+cat.t+'</a>'
+              : '<span class="cp-cat-heading">'+cat.t+'</span>';
+            const items = cat.items.map(i=>
+              '<li><a href="'+i.href+'" target="_blank" rel="noopener">'+i.t+'</a></li>'
+            ).join('');
+            return '<div class="cp-cat-group">'+heading+'<ul>'+items+'</ul></div>';
+          }).join('');
+        }
+      } else {
+        catsSection.hidden = true;
+      }
+    }
+
+    const p1 = root.querySelector('[data-role="cp-cta-primary"]');
+    if(p1) p1.textContent = C.ctaPrimary;
+    const p2 = root.querySelector('[data-role="cp-cta-secondary"]');
+    if(p2) p2.textContent = C.ctaSecondary;
+
+    const brand = (lang==='ar') ? 'شركة التراث للسجاد' : 'Heritage Carpet Company';
+    document.documentElement.setAttribute('data-title-'+lang, C.title + ' — ' + brand);
+    if(document.documentElement.getAttribute('lang') === lang){
+      document.title = C.title + ' — ' + brand;
+    }
+  }
+
+  /* ---------------- Our Brands page (brands.html) ----------------
+     Video header, then a tab per brand (Heritage / Platinum / Divano). Each
+     panel shows that brand's own Mission/Story/Approach content — kept in its
+     own natural shape rather than forced into an identical template, since
+     Platinum's supplied copy genuinely has more parts than Divano's — plus
+     photos and three action links (products, category page, showroom).
+     Photos/logo come from Assets/brands/{PREFIX}_... — see js/brands-data.js
+     for the exact filenames expected. ?brand=platinum opens that tab directly. */
+  function renderBrandsPage(config, root){
+    root = root || document;
+    const lang = root.getAttribute('data-lang') || 'en';
+    const B = window.HeritageBrandShowcase;
+    if(!B) return;
+    const T = B.i18n[lang] || B.i18n.en;
+
+    renderVideoHeader(root.querySelector('[data-role="brands-video"]'), B.video, T.title);
+
+    const set = (role, txt) => { const el = root.querySelector('[data-role="'+role+'"]'); if(el) el.textContent = txt; };
+    set('brands-kicker', T.kicker);
+    set('brands-title', T.title);
+    set('brands-lead', T.lead);
+
+    const tabsEl = root.querySelector('[data-role="brands-tabs"]');
+    const panelEl = root.querySelector('[data-role="brands-panel"]');
+    if(!tabsEl || !panelEl) return;
+
+    const param = new URLSearchParams(window.location.search).get('brand');
+    let active = (param && B.brands[param]) ? param : B.order[0];
+
+    function renderTabs(){
+      tabsEl.innerHTML = B.order.map(key=>{
+        const b = B.brands[key];
+        const C = b[lang] || b.en;
+        const linkMark = b.kind === 'link' ? '<span class="brand-tab-arrow" aria-hidden="true">&#8599;</span>' : '';
+        return '<button type="button" class="brand-tab-btn'+(key===active?' active':'')+(b.kind==='link'?' is-link':'')+'" data-brand="'+key+'">'+C.name+linkMark+'</button>';
+      }).join('');
+    }
+
+    function renderPanel(){
+      const b = B.brands[active];
+      const C = b[lang] || b.en;
+      const folder = b.folder || 'Assets/brands/';
+      const logoSrc = b.logo ? folder+b.logo : '';
+      const photoImgs = (b.photos || []).map(p => folder+p);
+
+      const media = '<div class="bs-media"><div class="motif">'+motifSVG(b.motif,'#C9DC5E')+buildCarouselMarkup(photoImgs)+'</div></div>';
+
+      const logoBlock = logoSrc ? (
+        '<div class="bs-logo">'+
+          '<img src="'+logoSrc+'" alt="'+C.name+'" loading="lazy" decoding="async">'+
+          '<span class="bs-logo-fallback">'+C.name+'</span>'+
+        '</div>'
+      ) : '<h3 class="bs-name-fallback">'+C.name+'</h3>';
+
+      const introHTML = C.intro ? '<p class="bs-intro">'+C.intro+'</p>' : '';
+
+      let bodyExtra;
+      if(b.kind === 'link'){
+        const highlightsHTML = (C.highlights && C.highlights.length)
+          ? '<div class="bs-highlights">'+C.highlights.map(h=>'<span class="bs-highlight">'+h+'</span>').join('')+'</div>'
+          : '';
+        bodyExtra = highlightsHTML +
+          '<div class="bs-actions"><a class="btn btn-fill" href="'+b.target+'">'+T.visitPage+'</a></div>';
+      } else {
+        const featuresHTML = (C.features && C.features.length)
+          ? '<div class="bs-features">'+C.features.map(f=>
+              '<div class="bs-feature"><h4>'+f.t+'</h4><p>'+f.b+'</p></div>'
+            ).join('')+'</div>'
+          : '';
+        const sectionsHTML = (C.sections || []).map(s=>
+          '<div class="bs-section"><h4>'+s.t+'</h4><p>'+s.b+'</p></div>'
+        ).join('');
+        const extAttr = (href) => /^https?:\/\//.test(href) ? ' target="_blank" rel="noopener"' : '';
+        const actionsHTML = (b.actions && b.actions.length)
+          ? '<div class="bs-actions">'+b.actions.map(a=>
+              '<a class="btn '+(a.key==='products'?'btn-fill':'btn-outline dark')+'" href="'+a.href+'"'+extAttr(a.href)+'>'+(T[a.key]||a.key)+'</a>'
+            ).join('')+'</div>'
+          : '';
+        bodyExtra = featuresHTML + sectionsHTML + actionsHTML;
+      }
+
+      panelEl.innerHTML = '<article class="bs-brand'+(b.kind==='link'?' is-link-preview':'')+'">'+
+        media +
+        '<div class="bs-body">'+
+          logoBlock +
+          '<p class="bs-tagline">'+C.tagline+'</p>' +
+          introHTML +
+          bodyExtra +
+        '</div>'+
+      '</article>';
+
+      panelEl.querySelectorAll('.bs-logo img').forEach(img=>{
+        img.addEventListener('error', function(){ img.classList.add('logo-missing'); }, {once:true});
+      });
+      initCarousels(panelEl);
+    }
+
+    tabsEl.addEventListener('click', function(e){
+      const btn = e.target.closest('.brand-tab-btn');
+      if(!btn) return;
+      active = btn.dataset.brand;
+      renderTabs(); renderPanel();
+      try{
+        const u = new URL(window.location.href);
+        u.searchParams.set('brand', active);
+        window.history.replaceState({}, '', u);
+      }catch(err){}
+    });
+
+    renderTabs();
+    renderPanel();
+  }
+
+  /* ---------------- Store locator (locations.html) ----------------
+     One page, three brand tabs. ?brand=platinum opens that tab directly, so
+     each brand still has its own shareable link. */
+  function renderLocationsPage(config, root){
+    root = root || document;
+    const lang = root.getAttribute('data-lang') || 'en';
+    const L = window.HeritageLocations;
+    if(!L) return;
+    const T = L.i18n[lang] || L.i18n.en;
+
+    const set = (role, txt) => { const el = root.querySelector('[data-role="'+role+'"]'); if(el) el.textContent = txt; };
+    set('loc-kicker', T.kicker);
+    set('loc-title', T.title);
+    set('loc-lead', T.lead);
+
+    const tabsEl = root.querySelector('[data-role="loc-tabs"]');
+    const panelEl = root.querySelector('[data-role="loc-panel"]');
+    if(!tabsEl || !panelEl) return;
+
+    const param = new URLSearchParams(window.location.search).get('brand');
+    let active = (param && L.brands[param]) ? param : L.order[0];
+
+    function renderTabs(){
+      tabsEl.innerHTML = L.order.map(k=>{
+        const b = L.brands[k];
+        const name = lang==='ar' ? b.name_ar : b.name_en;
+        return '<button type="button" class="loc-brand-btn'+(k===active?' active':'')+'" data-brand="'+k+'">'+
+          name+' <span class="loc-brand-count">'+b.branches.length+'</span>'+
+        '</button>';
+      }).join('');
+    }
+
+    function renderPanel(){
+      const b = L.brands[active];
+      const tagline = lang==='ar' ? b.tagline_ar : b.tagline_en;
+      const cards = b.branches.map(br=>{
+        const city = lang==='ar' ? br.city_ar : br.city_en;
+        const addr = lang==='ar' ? br.addr_ar : br.addr_en;
+        const name = lang==='ar' ? (br.name_ar||'') : (br.name_en||'');
+        const hours = lang==='ar' ? (br.hours_ar||'') : (br.hours_en||'');
+        const q = encodeURIComponent(br.q || (br.addr_en + ', Saudi Arabia'));
+        const phone = br.tel
+          ? '<a class="phone" href="tel:'+br.tel+'">&#9742; '+L.displayTel(br.tel)+'</a>'
+          : '<div class="loc-nophone">'+T.noPhone+'</div>';
+        return '<article class="loc-card">'+
+          '<div class="loc-card-visual" aria-hidden="true">'+
+            '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M24 44s15-13.5 15-24A15 15 0 1 0 9 20c0 10.5 15 24 15 24z"/><circle cx="24" cy="20" r="5.5"/></svg>'+
+          '</div>'+
+          '<div class="loc-card-body">'+
+            '<div class="showroom-city">'+city+'</div>'+
+            (name ? '<h3>'+name+'</h3>' : '')+
+            '<div class="addr">'+addr+'</div>'+
+            (hours ? '<div class="hours">'+hours+'</div>' : '')+
+            phone+
+            '<a class="btn btn-fill loc-directions-btn" href="https://www.google.com/maps/dir/?api=1&destination='+q+'" target="_blank" rel="noopener">'+T.directions+'</a>'+
+          '</div>'+
+        '</article>';
+      }).join('');
+      panelEl.innerHTML = '<p class="loc-tagline">'+tagline+'</p><div class="loc-cards-grid">'+cards+'</div>';
+    }
+
+    tabsEl.addEventListener('click', function(e){
+      const btn = e.target.closest('.loc-brand-btn');
+      if(!btn) return;
+      active = btn.dataset.brand;
+      renderTabs(); renderPanel();
+      // keep the URL shareable without reloading
+      try{
+        const u = new URL(window.location.href);
+        u.searchParams.set('brand', active);
+        window.history.replaceState({}, '', u);
+      }catch(err){}
+    });
+
+    renderTabs();
+    renderPanel();
+  }
+
+  /* ---------------- Language switching ---------------- */
+  function setLanguage(lang, opts){
+    opts = opts || {};
+    document.documentElement.setAttribute('lang', lang);
+    document.documentElement.setAttribute('dir', lang === 'ar' ? 'rtl' : 'ltr');
+
+    document.querySelectorAll('.lang-block').forEach(block => {
+      block.hidden = block.getAttribute('data-lang') !== lang;
+    });
+
+    const title = document.documentElement.getAttribute('data-title-' + lang);
+    if(title) document.title = title;
+
+    try { localStorage.setItem('heritage-lang', lang); } catch(e) {}
+
+    // Drive the EN/AR pill: the brass indicator position is CSS-driven off this class.
+    document.querySelectorAll('[data-lang-switch]').forEach(btn => {
+      btn.classList.toggle('ar-active', lang === 'ar');
+      btn.setAttribute('aria-label', lang === 'ar' ? 'Switch to English' : 'Switch to Arabic');
+    });
+
+    // Elements inside a hidden block can never trigger the IntersectionObserver, so
+    // anything already on screen in the block we just revealed would stay at opacity 0.
+    revealInView(document.querySelector('.lang-block[data-lang="'+lang+'"]'));
+
+    if(!opts.skipScroll) window.scrollTo(0, 0);
+    // The browser resolved any #hash before we knew which language block would be
+    // visible, so re-resolve it against the block that is actually shown.
+    if(opts.keepHash && window.location.hash){
+      const target = document.querySelector(window.location.hash);
+      if(target && target.scrollIntoView){
+        setTimeout(function(){ target.scrollIntoView({behavior:'auto', block:'start'}); }, 0);
+      }
+    }
+  }
+
+  function initLanguageSwitch(){
+    let stored = null;
+    try { stored = localStorage.getItem('heritage-lang'); } catch(e) {}
+
+    const initialLang = stored || document.documentElement.getAttribute('lang') || 'en';
+    setLanguage(initialLang, {skipScroll:true, keepHash:true});
+
+    document.querySelectorAll('[data-lang-switch]').forEach(btn => {
+      // The nav toggles are the EN/AR pill (they contain .lang-option spans); the footer
+      // ones are plain "EN / AR" text buttons. Without this flag the pill's fixed 58px
+      // sizing would squash the footer text, so mark them for the plain-button styling.
+      if(!btn.querySelector('.lang-option')) btn.classList.add('lang-toggle-text');
+
+      btn.addEventListener('click', function(){
+        const current = document.documentElement.getAttribute('lang');
+        setLanguage(current === 'ar' ? 'en' : 'ar');
+      });
+    });
+  }
+
+  /* ---------------- Common chrome: nav, hamburger, reveal, logo fallback, year ---------------- */
+  function initCommon(){
+    document.querySelectorAll('[data-role="nav"]').forEach(nav=>{
+      window.addEventListener('scroll', function(){
+        nav.classList.toggle('solid', window.scrollY > 40);
+      }, {passive:true});
+    });
+
+    document.querySelectorAll('[data-role="hamburger"]').forEach(hamburger=>{
+      const block = hamburger.closest('.lang-block') || document;
+      const mobileMenu = block.querySelector('[data-role="mobile-menu"]');
+      if(!mobileMenu) return;
+      hamburger.addEventListener('click', function(){
+        hamburger.classList.toggle('open');
+        mobileMenu.classList.toggle('open');
+      });
+      mobileMenu.querySelectorAll('a').forEach(a => a.addEventListener('click', function(){
+        hamburger.classList.remove('open');
+        mobileMenu.classList.remove('open');
+      }));
+    });
+
+    // Photo fallback: if a real image (logo, hero, or any Assets/ photo) hasn't been
+    // uploaded yet or fails to load, remove it gracefully so the SVG motif underneath
+    // (or the text wordmark, for the logo) shows through instead of a broken-image icon.
+    document.querySelectorAll('.logo-img').forEach(img=>{
+      img.addEventListener('error', function(){ img.classList.add('logo-missing'); }, {once:true});
+    });
+    document.querySelectorAll('.motif-photo').forEach(img=>{
+      img.addEventListener('error', function(){ img.remove(); }, {once:true});
+    });
+    // page-header background image/video: on failure, drop the whole media layer
+    // (not just the broken element) so the scrim doesn't linger over nothing —
+    // this restores the header to its original plain dark background exactly.
+    document.querySelectorAll('.page-header-media').forEach(wrap=>{
+      const media = wrap.querySelector('img, video');
+      if(!media) return;
+      const fail = function(){ wrap.remove(); };
+      media.addEventListener('error', fail, {once:true});
+      if(media.tagName === 'VIDEO'){
+        const src = media.querySelector('source');
+        if(src) src.addEventListener('error', fail, {once:true});
+      }
+    });
+
+    // threshold must be 0, not a fraction. intersectionRatio is visibleArea/totalArea,
+    // so an element taller than ~10x the viewport can never reach 0.1 — which is exactly
+    // what happened to the single-column product grid on phones (22 cards ≈ 10,000px tall,
+    // max ratio ≈ 0.076). It stayed at opacity 0 until a filter shortened the grid enough
+    // to cross the threshold, which looked like "products only appear after filtering".
+    const io = new IntersectionObserver((entries)=>{
+      entries.forEach(e=>{ if(e.isIntersecting){ e.target.classList.add('is-visible'); io.unobserve(e.target); } });
+    }, {threshold:0, rootMargin:'0px 0px -40px 0px'});
+    document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
+    document.querySelectorAll('.section-head').forEach(el=>{ el.classList.add('reveal'); io.observe(el); });
+
+    // Belt and braces: reveal anything already on screen right now, so content can never
+    // be stranded at opacity 0 if the observer misbehaves or is unsupported.
+    revealInView(document);
+
+    document.querySelectorAll('[data-role="year"]').forEach(el=>{ el.textContent = new Date().getFullYear(); });
+
+    initLanguageSwitch();
+
+    // Final safety sweep once layout has settled, then again on resize/orientation
+    // change — phones report a very different viewport after the URL bar collapses.
+    revealInView(document);
+    window.addEventListener('load', function(){ revealInView(document); });
+    window.addEventListener('resize', function(){ revealInView(document); }, {passive:true});
+    window.addEventListener('orientationchange', function(){ revealInView(document); });
+  }
+
+
+  /* ---------------- Home page render (called once per language block) ---------------- */
+  function renderHomePage(content, root){
+    root = root || document;
+
+    renderVideoHeader(root.querySelector('[data-role="hero-video"]'), content.heroVideo, 'Heritage Carpet Company');
+
+    // ---- Our Brands: umbrella hierarchy (Heritage Group over its five brands) ----
+    // Reads straight from window.HeritageBrandShowcase (the same data brands.html
+    // uses), so the two never drift apart — one source of brand copy, two views
+    // of it. Every card links to that brand's own tab on brands.html; product
+    // links, "Branches" links etc. all live on brands.html itself now, not here.
+    const hierarchyEl = root.querySelector('[data-role="brand-hierarchy"]');
+    if(hierarchyEl && window.HeritageBrandShowcase){
+      const B = window.HeritageBrandShowcase;
+      const lang = root.getAttribute('data-lang') || 'en';
+      const parentKey = B.order[0];
+      const childKeys = B.order.slice(1);
+      const cardHTML = (key, isParent) => {
+        const b = B.brands[key];
+        const C = b[lang] || b.en;
+        const href = 'brands.html?brand=' + key;
+        return '<a class="'+(isParent?'brand-parent':'brand-child')+'" href="'+href+'">'+
+          '<div class="brand-mark" data-motif="'+b.motif+'"></div>'+
+          '<h3>'+C.name+'</h3>'+
+          '<p>'+C.tagline+'</p>'+
+        '</a>';
+      };
+      hierarchyEl.innerHTML =
+        cardHTML(parentKey, true) +
+        '<div class="brand-connector" aria-hidden="true"></div>' +
+        '<div class="brand-children">' + childKeys.map(k=>cardHTML(k, false)).join('') + '</div>';
+    }
+
+    const timelineItems = root.querySelectorAll('.timeline-item');
+    timelineItems.forEach(item=>{
+      item.addEventListener('click', function(){
+        timelineItems.forEach(t=>t.classList.remove('active'));
+        item.classList.add('active');
+      });
+    });
+
+    const collectionsGrid = root.querySelector('[data-role="collections-grid"]');
+    if(collectionsGrid && content.collections){
+      collectionsGrid.innerHTML = content.collections.map(c=>{
+        const external = c.href.indexOf('http') === 0;
+        const photo = buildCarouselMarkup(resolveImages(c, 'collections'));
+        return '<div class="collection-card"><div class="motif">'+motifSVG(c.motif)+photo+'</div><div class="scrim"></div>'+
+          '<div class="body"><div class="num">'+c.n+'</div><h3>'+c.t+'</h3><p>'+c.d+'</p></div>'+
+          '<a class="card-link" href="'+c.href+'" aria-label="'+c.t+'"'+(external?' target="_blank" rel="noopener"':'')+'></a></div>';
+      }).join('');
+    }
+
+    const journeyEl = root.querySelector('[data-role="journey"]');
+    if(journeyEl && content.journey){
+      journeyEl.innerHTML = content.journey.map((s,i)=>
+        '<div class="journey-step'+(i===0?' active':'')+'" data-i="'+i+'"><div class="jnum">'+s.n+'</div><h4>'+s.t+'</h4><div class="jdesc">'+s.d+'</div></div>'
+      ).join('');
+      journeyEl.querySelectorAll('.journey-step').forEach(el=>{
+        el.addEventListener('click', function(){
+          journeyEl.querySelectorAll('.journey-step').forEach(x=>x.classList.remove('active'));
+          el.classList.add('active');
+        });
+      });
+    }
+
+    const commercialGrid = root.querySelector('[data-role="commercial-grid"]');
+    if(commercialGrid && content.commercial){
+      // each card links through to the matching solution on the Projects page
+      commercialGrid.innerHTML = content.commercial.map(c=>{
+        const inner = '<svg viewBox="0 0 24 24" fill="none" stroke-width="1.3">'+ICONS[c.icon]+'</svg><h4>'+c.t+'</h4><p>'+c.d+'</p>';
+        return c.href
+          ? '<a class="commercial-card is-link" href="'+c.href+'">'+inner+'</a>'
+          : '<div class="commercial-card">'+inner+'</div>';
+      }).join('');
+    }
+
+    const projectsGrid = root.querySelector('[data-role="projects-grid"]');
+    if(projectsGrid && content.projects){
+      // the homepage shows a short selection; the full set lives on projects.html
+      const projectList = content.projectsLimit ? content.projects.slice(0, content.projectsLimit) : content.projects;
+      projectsGrid.innerHTML = projectList.map(p=>{
+        const photo = buildCarouselMarkup(resolveImages(p, 'projects'));
+        return '<div class="project-item" data-cat="'+p.cat+'"><div class="motif" style="--ar:'+p.aspect+'">'+motifSVG(p.motif,'#C9DC5E')+photo+'</div>'+
+        '<div class="p-body"><div class="p-tag">'+content.catLabel[p.cat]+'</div><div class="p-title">'+p.t+'</div></div></div>';
+      }).join('');
+    }
+    const filterBar = root.querySelector('[data-role="filter-bar"]');
+    if(filterBar){
+      filterBar.addEventListener('click', function(e){
+        const btn = e.target.closest('.filter-btn');
+        if(!btn) return;
+        filterBar.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));
+        btn.classList.add('active');
+        const f = btn.dataset.f;
+        root.querySelectorAll('.project-item').forEach(item=>{
+          item.classList.toggle('hidden', f!=='all' && item.dataset.cat!==f);
+        });
+      });
+    }
+
+    const testiSlides = root.querySelector('[data-role="testi-slides"]');
+    const testiDots = root.querySelector('[data-role="testi-dots"]');
+    if(testiSlides && testiDots && content.testimonials){
+      const testimonials = content.testimonials;
+      testiSlides.innerHTML = testimonials.map((t,i)=>
+        '<div class="testi-slide'+(i===0?' active':'')+'"><p class="testi-quote">"'+t.q+'"</p><div class="testi-name">'+t.n+'</div><div class="testi-role">'+t.r+'</div></div>'
+      ).join('');
+      testiDots.innerHTML = testimonials.map((_,i)=>'<span class="testi-dot'+(i===0?' active':'')+'" data-i="'+i+'"></span>').join('');
+      let testiIndex = 0;
+      function showTesti(i){
+        testiIndex = (i+testimonials.length)%testimonials.length;
+        root.querySelectorAll('.testi-slide').forEach((s,idx)=>s.classList.toggle('active', idx===testiIndex));
+        root.querySelectorAll('.testi-dot').forEach((d,idx)=>d.classList.toggle('active', idx===testiIndex));
+      }
+      const prevBtn = root.querySelector('[data-role="testi-prev"]');
+      const nextBtn = root.querySelector('[data-role="testi-next"]');
+      if(prevBtn) prevBtn.addEventListener('click', ()=>showTesti(testiIndex-1));
+      if(nextBtn) nextBtn.addEventListener('click', ()=>showTesti(testiIndex+1));
+      testiDots.addEventListener('click', function(e){
+        const dot = e.target.closest('.testi-dot');
+        if(dot) showTesti(parseInt(dot.dataset.i,10));
+      });
+      if(!reducedMotion){
+        let timer = setInterval(()=>showTesti(testiIndex+1), 6500);
+        const wrap = root.querySelector('.testi-wrap');
+        if(wrap){
+          wrap.addEventListener('mouseenter', ()=>clearInterval(timer));
+          wrap.addEventListener('mouseleave', ()=>{ timer = setInterval(()=>showTesti(testiIndex+1), 6500); });
+        }
+      }
+    }
+
+    // ---- Our Clients: auto-scrolling logo marquee ----
+    // Filenames are just sequential numbers (1, 2, 3, ...) in Assets/Clients/, so
+    // logos can be added over time with no code changes. Each slot tries .png first,
+    // then .jpg, before giving up — so either format works and nothing needs
+    // renaming. Whichever slots don't exist in either format simply never appear
+    // (same onerror-remove pattern used everywhere else on the site). The track is
+    // duplicated once for a seamless CSS loop — both copies try the same URLs in the
+    // same order, so they always end up identical, which is what keeps the loop math
+    // (translateX -50%) exact even after some slots fail. There can be more than one
+    // track (a second row scrolling the opposite way) — each is populated and
+    // recovers from missing logos independently, from the same numbered pool.
+    const clientsTracks = root.querySelectorAll('[data-role^="clients-track"]');
+    clientsTracks.forEach(clientsTrack=>{
+      const CLIENTS_FOLDER = 'Assets/Clients/';
+      // Assets/Clients currently holds 1..22. Raise this when more are added;
+      // a number that doesn't exist simply removes itself, so overshooting is
+      // harmless while undershooting silently drops logos.
+      const CLIENTS_ATTEMPT_COUNT = 22;
+      // .jfif is included because two of the supplied files use it — without
+      // it those two always failed and were removed from the row.
+      const CLIENTS_EXTENSIONS = ['png', 'jpg', 'jfif'];
+      const nums = [];
+      for(let i=1;i<=CLIENTS_ATTEMPT_COUNT;i++){ nums.push(i); }
+      const renderSet = () => nums.map(n=>
+        '<div class="client-logo"><img src="'+CLIENTS_FOLDER+n+'.'+CLIENTS_EXTENSIONS[0]+'" data-num="'+n+'" data-ext-stage="0" alt="" loading="lazy"></div>'
+      ).join('');
+      clientsTrack.innerHTML = renderSet() + renderSet();
+      clientsTrack.querySelectorAll('img').forEach(img=>{
+        img.addEventListener('error', function(){
+          const stage = parseInt(img.dataset.extStage, 10) + 1;
+          if(stage < CLIENTS_EXTENSIONS.length){
+            img.dataset.extStage = String(stage);
+            img.src = CLIENTS_FOLDER + img.dataset.num + '.' + CLIENTS_EXTENSIONS[stage];
+          } else {
+            const wrap = img.closest('.client-logo');
+            if(wrap) wrap.remove();
+            ensureWideEnough();
+          }
+        });
+      });
+
+      /* The loop works by translating exactly 50% of the track, which lands on
+         the seam of the duplicated set. That is only seamless while one set is
+         at least as wide as the visible strip — if enough logo files are
+         missing the row becomes short and a visible gap sweeps through. Keep
+         doubling until it is wide enough (bounded, so a folder with one logo
+         can't spin forever). */
+      let balancing = false;
+      function ensureWideEnough(){
+        if(balancing) return;
+        balancing = true;
+        requestAnimationFrame(()=>{
+          balancing = false;
+          const strip = clientsTrack.parentElement;
+          if(!strip || !clientsTrack.children.length) return;
+          const need = strip.clientWidth || 0;
+          let guard = 0;
+          while(clientsTrack.scrollWidth / 2 < need && guard++ < 4){
+            clientsTrack.innerHTML += clientsTrack.innerHTML;
+          }
+        });
+      }
+      ensureWideEnough();
+      window.addEventListener('resize', ensureWideEnough, { passive:true });
+    });
+
+    initCarousels(root);
+  }
+
+  /* ---------------- Collections / PLP page render (called once per language block) ---------------- */
+  function renderCollectionsPage(config, root){
+    root = root || document;
+    const L = config.labels;
+    const i18n = config.i18n;
+
+    /* ---------------- category structure ----------------
+       Three levels, defined in js/data.js so adding a branch is a data edit:
+
+         Division      Area Rugs | Flooring | Furniture
+         Category      Handmade Rug, Carpet Tiles, Vinyl Flooring, ...
+         Sub-category  Persian, Crayon, Toscana, ...
+
+       Each row of controls appears only once its parent is chosen, so the
+       page opens as three simple choices rather than twenty.
+
+       Furniture and accessories products stay out of this page: it is the
+       rug and flooring catalogue, and Divano furniture has its own page and
+       store. The Furniture DIVISION is shown because it was asked for, and
+       currently holds nothing. */
+    const TREE = (window.HeritageData && window.HeritageData.tree) || { order:[], divisions:{}, subs:{}, legacy:{} };
+    const EXCLUDED = ['furniture','accessories'];
+
+    const PRODUCTS = config.products.filter(p =>
+      !(p.category || []).some(c => EXCLUDED.indexOf(c) > -1));
+
+    const state = { division:null, category:null, subs:new Set(),
+                    color:'', size:'', sort:'featured', view:'large' };
+
+    const VIEW_KEY = 'heritage.collections.view';
+    try{
+      const saved = localStorage.getItem(VIEW_KEY);
+      if(saved === 'large' || saved === 'medium' || saved === 'list') state.view = saved;
+    }catch(err){}
+
+    /* ?category= still works for every old link. The tree carries a map from
+       each retired tag to its place in the new structure. */
+    const qCat = new URLSearchParams(window.location.search).get('category');
+    if(qCat){
+      const legacy = TREE.legacy[qCat];
+      if(legacy){
+        state.division = legacy[0];
+        state.category = legacy[1];
+        if(legacy[2]) state.subs.add(legacy[2]);
+      }else if(TREE.divisions[qCat]){
+        state.division = qCat;
+      }else{
+        // a category key used directly, e.g. ?category=vinyl-flooring
+        Object.keys(TREE.divisions).forEach(d=>{
+          if(TREE.divisions[d].indexOf(qCat) > -1){ state.division = d; state.category = qCat; }
+        });
+      }
+    }
+
+    const inDivision = (p, d) => p.category[0] === d;
+    const inCategory = (p, c) => p.category[1] === c;
+
+    function countDivision(d){ return PRODUCTS.filter(p => inDivision(p, d)).length; }
+    function countCategory(c){ return PRODUCTS.filter(p => inCategory(p, c)).length; }
+    function countSub(sub){ return PRODUCTS.filter(p => p.category.indexOf(sub) > 2 || p.category.slice(2).indexOf(sub) > -1).length; }
+
+    /* row 1 — divisions */
+    function renderMajorBar(){
+      const el = root.querySelector('[data-role="category-bar"]');
+      if(!el) return;
+      const all = '<button type="button" class="cat-pill'+(state.division===null?' active':'')+'" data-division="">'+
+                  (i18n.allPieces || 'All')+'<span class="cat-pill-count">'+PRODUCTS.length+'</span></button>';
+      el.innerHTML = all + TREE.order.map(d=>
+        '<button type="button" class="cat-pill'+(state.division===d?' active':'')+'" data-division="'+d+'">'+
+          (L.category[d] || d)+'<span class="cat-pill-count">'+countDivision(d)+'</span></button>'
+      ).join('');
+    }
+
+    /* row 2 — categories inside the chosen division */
+    function renderCategoryBar(){
+      const el = root.querySelector('[data-role="category-sub-bar"]');
+      if(!el) return;
+      const cats = state.division ? (TREE.divisions[state.division] || []) : [];
+      if(!cats.length){ el.innerHTML = ''; el.hidden = true; return; }
+      el.hidden = false;
+      el.innerHTML = cats.map(c=>{
+        const n = countCategory(c);
+        return '<button type="button" class="style-chip'+(state.category===c?' active':'')+
+               (n===0?' is-empty':'')+'" data-category="'+c+'">'+
+               (L.category[c] || c)+'<span class="chip-count">'+n+'</span></button>';
+      }).join('');
+    }
+
+    /* row 3 — sub-categories inside the chosen category */
+    function renderStyleBar(){
+      const el = root.querySelector('[data-role="style-bar"]');
+      if(!el) return;
+      const subs = state.category ? (TREE.subs[state.category] || []) : [];
+      if(!subs.length){ el.innerHTML = ''; el.hidden = true; return; }
+      el.hidden = false;
+      el.innerHTML = subs.map(sb=>
+        '<button type="button" class="style-chip'+(state.subs.has(sb)?' active':'')+'" data-style="'+sb+'">'+
+          (L.category[sb] || sb)+'</button>'
+      ).join('');
+    }
+
+    function fillSelect(role, labels, current){
+      const el = root.querySelector('[data-role="'+role+'"]');
+      if(!el) return;
+      const present = Object.keys(labels).filter(k =>
+        PRODUCTS.some(p => (role.indexOf('size') > -1 ? p.size : p.color) === k));
+      const first = el.querySelector('option[value=""]');
+      const allLabel = first ? first.textContent : '';
+      el.innerHTML = '<option value="">'+allLabel+'</option>' + present.map(k=>{
+        const n = PRODUCTS.filter(p => (role.indexOf('size') > -1 ? p.size : p.color) === k).length;
+        const short = labels[k].split(' (')[0];
+        return '<option value="'+k+'"'+(current===k?' selected':'')+'>'+short+' ('+n+')</option>';
+      }).join('');
+    }
+
+    function applyView(){
+      const grid = root.querySelector('[data-role="product-grid"]');
+      if(grid){
+        grid.classList.remove('view-large','view-medium','view-list');
+        grid.classList.add('view-' + state.view);
+      }
+      root.querySelectorAll('[data-role="view-switch"] .view-btn').forEach(b=>{
+        const on = b.dataset.view === state.view;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
+    }
+
+    function renderFilters(){
+      renderMajorBar();
+      renderCategoryBar();
+      renderStyleBar();
+      applyView();
+      fillSelect('filter-size-select',  L.size,  state.size);
+      fillSelect('filter-color-select', L.color, state.color);
+    }
+
+    function matches(p){
+      let catOk = true;
+      if(state.division) catOk = p.category[0] === state.division;
+      if(catOk && state.category) catOk = p.category[1] === state.category;
+      // a sub-category narrows within its category, it does not replace it
+      if(catOk && state.subs.size) catOk = p.category.slice(2).some(c => state.subs.has(c));
+      const colOk  = !state.color || p.color === state.color;
+      const sizeOk = !state.size  || p.size  === state.size;
+      return catOk && colOk && sizeOk;
+    }
+
+    function sortProducts(list){
+      const arr = list.slice();
+      if(state.sort==='name') arr.sort((a,b)=>a.name.localeCompare(b.name));
+      else if(state.sort==='newest') arr.sort((a,b)=>(b.isNew?1:0)-(a.isNew?1:0));
+      return arr;
+    }
+
+    function renderChips(){
+      const chips = [];
+      if(state.division){
+        chips.push('<span class="chip" data-group="division" data-val="'+state.division+'">'+
+          (L.category[state.division]||state.division)+' <button type="button" aria-label="Remove filter">\u2715</button></span>');
+      }
+      if(state.category){
+        chips.push('<span class="chip" data-group="category" data-val="'+state.category+'">'+
+          (L.category[state.category]||state.category)+' <button type="button" aria-label="Remove filter">\u2715</button></span>');
+      }
+      ['color','size'].forEach(g=>{
+        if(!state[g]) return;
+        const lbl = (L[g][state[g]] || state[g]).split(' (')[0];
+        chips.push('<span class="chip" data-group="'+g+'" data-val="'+state[g]+'">'+lbl+' <button type="button" aria-label="Remove filter">\u2715</button></span>');
+      });
+      state.subs.forEach(function(v){
+        chips.push('<span class="chip" data-group="subs" data-val="'+v+'">'+
+          (L.category[v]||v)+' <button type="button" aria-label="Remove filter">\u2715</button></span>');
+      });
+      [].forEach(group=>{
+        state[group].forEach(val=>{
+          const lbl = (group==='style' ? L.category[val] : L[group][val]) || val;
+          chips.push('<span class="chip" data-group="'+group+'" data-val="'+val+'">'+lbl+' <button type="button" aria-label="Remove filter">\u2715</button></span>');
+        });
+      });
+      const chipsEl = root.querySelector('[data-role="chips"]');
+      if(chipsEl) chipsEl.innerHTML = chips.join('');
+    }
+
+    function renderProducts(){
+      const filtered = sortProducts(PRODUCTS.filter(matches));
+      const grid = root.querySelector('[data-role="product-grid"]');
+      if(grid){
+        clearCarousels(grid); // stop timers from the previous filter/sort pass before discarding those cards
+        grid.innerHTML = filtered.map(p=>{
+          const detailUrl = 'product.html?handle=' + encodeURIComponent(p.handle);
+          const inquireSubject = encodeURIComponent(i18n.inquireSubjectPrefix + p.name);
+          const swatchColor = p.color==='ivory' ? '#B7CC33' : '#C9DC5E';
+          const photo = buildCarouselMarkup(resolveImages(p, 'products'));
+          // Meta line is built from whatever fields the item actually has, so furniture and
+          // accessories (which have no rug "size") don't break the card.
+          const metaParts = [];
+          if(L.material[p.material]) metaParts.push(L.material[p.material]);
+          if(L.color[p.color]) metaParts.push(L.color[p.color]);
+          if(p.size && L.size[p.size]) metaParts.push(L.size[p.size].split(' (')[0].split('(')[0]);
+          const badge = p.sale
+            ? '<span class="product-tag sale">-'+p.sale.percent+'%</span>'
+            : (p.isNew ? '<span class="product-tag">'+i18n.newTag+'</span>' : '');
+          return '<div class="product-card">'+
+            '<div class="product-media">'+ badge +
+            '<div class="motif">'+motifSVG(p.motif, swatchColor)+photo+'</div>'+
+            '<a class="product-media-link" href="'+detailUrl+'" aria-label="'+p.name+'"></a></div>'+
+            '<div class="product-body">'+
+              '<div class="product-origin">'+L.category[p.category[p.category.length-1]]+'</div>'+
+              '<div class="product-name"><a href="'+detailUrl+'">'+p.name+'</a></div>'+
+              '<div class="product-meta">'+metaParts.join(' \u00b7 ')+'</div>'+
+              '<div class="product-actions">'+
+                '<a class="btn btn-fill btn-sm" href="'+detailUrl+'">'+i18n.viewDetails+'</a>'+
+                '<a class="btn btn-outline dark btn-sm" href="mailto:info@heritagecarpet.sa?subject='+inquireSubject+'">'+i18n.inquire+'</a>'+
+              '</div>'+
+            '</div></div>';
+        }).join('');
+        initCarousels(grid);
+        revealNow(grid); // content we just rendered must never sit at opacity 0
+      }
+      const resultCountEl = root.querySelector('[data-role="result-count"]');
+      if(resultCountEl) resultCountEl.textContent = i18n.resultCount.replace('{count}', filtered.length).replace('{total}', PRODUCTS.length);
+      const emptyEl = root.querySelector('[data-role="empty-state"]');
+      if(emptyEl){
+        emptyEl.classList.toggle('show', filtered.length===0);
+        /* Furniture is sold through Divano's own store, so a furniture branch
+           with nothing in this catalogue should hand the visitor onward rather
+           than leave them at a dead end. */
+        const node = [...state.subs][0] || state.category || state.division;
+        const url = filtered.length===0 && TREE.links ? TREE.links[node] : null;
+        let cta = emptyEl.querySelector('[data-role="empty-cta"]');
+        if(url){
+          if(!cta){
+            cta = document.createElement('a');
+            cta.className = 'btn btn-fill';
+            cta.setAttribute('data-role','empty-cta');
+            cta.setAttribute('target','_blank');
+            cta.setAttribute('rel','noopener');
+            emptyEl.appendChild(cta);
+          }
+          cta.href = url;
+          cta.textContent = (i18n.shopOnDivano || 'Shop this range on Divano');
+          cta.hidden = false;
+        }else if(cta){ cta.hidden = true; }
+      }
+      renderChips();
+    }
+
+    function refreshAll(){ renderFilters(); renderProducts(); }
+
+    const divBar = root.querySelector('[data-role="category-bar"]');
+    if(divBar){
+      divBar.addEventListener('click', function(e){
+        const b = e.target.closest('[data-division]');
+        if(!b) return;
+        const key = b.dataset.division || null;
+        if(state.division !== key){ state.category = null; state.subs.clear(); }
+        state.division = key;
+        refreshAll();
+      });
+    }
+    const catBar = root.querySelector('[data-role="category-sub-bar"]');
+    if(catBar){
+      catBar.addEventListener('click', function(e){
+        const b = e.target.closest('[data-category]');
+        if(!b) return;
+        const key = b.dataset.category;
+        // tapping the active category clears it, so you can step back up
+        state.category = (state.category === key) ? null : key;
+        state.subs.clear();
+        refreshAll();
+      });
+    }
+    const styleBar = root.querySelector('[data-role="style-bar"]');
+    if(styleBar){
+      styleBar.addEventListener('click', function(e){
+        const b = e.target.closest('[data-style]');
+        if(!b) return;
+        const v = b.dataset.style;
+        if(state.subs.has(v)) state.subs.delete(v); else state.subs.add(v);
+        refreshAll();
+      });
+    }
+
+    const viewSwitch = root.querySelector('[data-role="view-switch"]');
+    if(viewSwitch){
+      viewSwitch.addEventListener('click', function(e){
+        const b = e.target.closest('[data-view]');
+        if(!b || b.dataset.view === state.view) return;
+        state.view = b.dataset.view;
+        try{ localStorage.setItem(VIEW_KEY, state.view); }catch(err){}
+        applyView();
+      });
+    }
+
+    ['filter-size-select','filter-color-select'].forEach(role=>{
+      const el = root.querySelector('[data-role="'+role+'"]');
+      if(!el) return;
+      el.addEventListener('change', function(){
+        state[role.indexOf('size') > -1 ? 'size' : 'color'] = el.value;
+        refreshAll();
+      });
+    });
+
+    const chipsContainer = root.querySelector('[data-role="chips"]');
+    if(chipsContainer){
+      chipsContainer.addEventListener('click', function(e){
+        const btn = e.target.closest('button');
+        if(!btn) return;
+        const chip = btn.closest('.chip');
+        const g = chip.dataset.group;
+        if(g === 'division'){ state.division = null; state.category = null; state.subs.clear(); }
+        else if(g === 'category'){ state.category = null; state.subs.clear(); }
+        else if(g === 'subs'){ state.subs.delete(chip.dataset.val); }
+        else if(g === 'color' || g === 'size'){ state[g] = ''; }
+        refreshAll();
+      });
+    }
+    const clearBtn = root.querySelector('[data-role="clear-filters"]');
+    if(clearBtn){
+      clearBtn.addEventListener('click', function(){
+        state.division = null; state.category = null; state.color = ''; state.size = '';
+        state.subs.clear();
+        refreshAll();
+      });
+    }
+    const sortSelect = root.querySelector('[data-role="sort-select"]');
+    if(sortSelect){
+      sortSelect.addEventListener('change', function(e){
+        state.sort = e.target.value;
+        renderProducts();
+      });
+    }
+
+    // the mobile filter drawer is gone with the sidebar: every control now
+    // lives in the toolbar, which is reachable at any width without a drawer
+    refreshAll();
+  }
+
+  /* ---------------- Bespoke Studio wizard (called once per language block) ---------------- */
+  function renderBespokeStudio(config, root){
+    root = root || document;
+    const langSuffix = '-' + (root.getAttribute('data-lang') || 'x');
+    const uid = (base) => base + langSuffix;
+
+    const i18n = config.i18n;
+    const STEP_COUNT = 7;
+    const state = {
+      step:0, maxReached:0,
+      room:null, shape:null, widthM:3, lengthM:4, customShapeDesc:'',
+      material:null, color:config.colors[1] ? config.colors[1].key : null, customHex:null,
+      pattern:null, files:[], notes:'',
+      name:'', email:'', phone:'', phoneCode:'+966', showroom:null, contactMethod:null
+    };
+
+    const stepContainer = root.querySelector('[data-role="wizard-step"]');
+    const progressEl = root.querySelector('[data-role="step-progress"]');
+    const backBtn = root.querySelector('[data-role="back-btn"]');
+    const continueBtn = root.querySelector('[data-role="continue-btn"]');
+    if(!stepContainer) return;
+
+    function canContinue(){
+      switch(state.step){
+        case 0: return !!state.room;
+        case 1: return !!state.shape && (state.shape==='custom' ? true : state.widthM>0 && (state.shape==='round' ? true : state.lengthM>0));
+        case 2: return !!state.material;
+        case 3: return !!(state.color || state.customHex);
+        case 4: return !!state.pattern;
+        default: return true;
+      }
+    }
+
+    function renderProgress(){
+      let html = '';
+      for(let i=0;i<STEP_COUNT;i++){
+        const cls = i===state.step ? 'current' : (i<state.maxReached || i<state.step ? 'done' : '');
+        const clickable = i<=state.maxReached ? ' clickable' : '';
+        html += '<div class="step-dot-wrap"><div class="step-dot '+cls+clickable+'" data-goto="'+i+'">'+(i+1)+'</div>';
+        if(i<STEP_COUNT-1) html += '<div class="step-connector '+(i<state.maxReached?'done':'')+'"></div>';
+        html += '</div>';
+      }
+      progressEl.innerHTML = html;
+    }
+
+    function optionCard(field, key, label, note, extra){
+      const sel = state[field]===key ? ' selected' : '';
+      return '<div class="option-card'+sel+'" data-field="'+field+'" data-value="'+key+'">'+
+        '<h4>'+label+'<span class="check"></span></h4>'+
+        (note?'<p>'+note+'</p>':'') + (extra||'') + '</div>';
+    }
+
+    function renderStepContent(){
+      let html = '';
+      const s = state.step;
+      if(s===0){
+        html = '<div class="eyebrow on-light step-kicker">'+i18n.stepOfLabel.replace('{n}',1)+'</div>'+
+          '<h2>'+i18n.stepTitle[0]+'</h2><p class="step-intro">'+i18n.stepIntro[0]+'</p>'+
+          '<div class="option-grid">'+config.rooms.map(r=>optionCard('room',r.key,r.label,r.note)).join('')+'</div>';
+      } else if(s===1){
+        html = '<div class="eyebrow on-light step-kicker">'+i18n.stepOfLabel.replace('{n}',2)+'</div>'+
+          '<h2>'+i18n.stepTitle[1]+'</h2><p class="step-intro">'+i18n.stepIntro[1]+'</p>'+
+          '<div class="option-grid">'+config.shapes.map(sh=>optionCard('shape',sh.key,sh.label,sh.note)).join('')+'</div>';
+        if(state.shape==='custom'){
+          html += '<div class="custom-shape-note"><label style="display:block;font-size:12px;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;color:var(--madder);margin-bottom:10px;">'+i18n.customShapeLabel+'</label>'+
+            '<textarea class="field-input" id="'+uid('customShapeInput')+'" rows="3" placeholder="'+i18n.customShapePlaceholder+'">'+state.customShapeDesc+'</textarea></div>';
+        } else if(state.shape==='round'){
+          html += '<div class="dim-row"><div class="dim-field"><label>'+i18n.diameterLabel+'</label>'+
+            '<input type="number" min="0.5" step="0.1" id="'+uid('widthInput')+'" value="'+state.widthM+'"></div></div>';
+        } else if(state.shape==='square'){
+          html += '<div class="dim-row"><div class="dim-field"><label>'+i18n.sideLabel+'</label>'+
+            '<input type="number" min="0.5" step="0.1" id="'+uid('widthInput')+'" value="'+state.widthM+'"></div></div>';
+        } else if(state.shape){
+          html += '<div class="dim-row">'+
+            '<div class="dim-field"><label>'+i18n.widthLabel+'</label><input type="number" min="0.5" step="0.1" id="'+uid('widthInput')+'" value="'+state.widthM+'"></div>'+
+            '<div class="dim-field"><label>'+i18n.lengthLabel+'</label><input type="number" min="0.5" step="0.1" id="'+uid('lengthInput')+'" value="'+state.lengthM+'"></div>'+
+            '</div>' + (state.shape==='runner' ? '<p class="dim-note">'+i18n.runnerNote+'</p>' : '');
+        }
+      } else if(s===2){
+        html = '<div class="eyebrow on-light step-kicker">'+i18n.stepOfLabel.replace('{n}',3)+'</div>'+
+          '<h2>'+i18n.stepTitle[2]+'</h2><p class="step-intro">'+i18n.stepIntro[2]+'</p>'+
+          '<div class="option-grid">'+config.materials.map(m=>optionCard('material',m.key,m.label,m.desc)).join('')+'</div>';
+      } else if(s===3){
+        const effHex = state.customHex || (config.colors.find(c=>c.key===state.color)||{}).hex;
+        html = '<div class="eyebrow on-light step-kicker">'+i18n.stepOfLabel.replace('{n}',4)+'</div>'+
+          '<h2>'+i18n.stepTitle[3]+'</h2><p class="step-intro">'+i18n.stepIntro[3]+'</p>'+
+          '<div class="color-grid">'+config.colors.map(c=>
+            '<div class="color-option'+(!state.customHex && state.color===c.key?' selected':'')+'" data-field="color" data-value="'+c.key+'">'+
+            '<div class="swatch-lg" style="background:'+c.hex+'"></div><span>'+c.label+'</span></div>'
+          ).join('')+'</div>'+
+          '<div class="custom-color-row"><input type="color" id="'+uid('customColorInput')+'" value="'+(effHex||'#B7CC33')+'">'+
+          '<div><div style="font-size:13px;font-weight:600;">'+i18n.customColorLabel+'</div>'+
+          '<div class="hex-readout" id="'+uid('hexReadout')+'">'+(state.customHex ? state.customHex.toUpperCase() : i18n.notSelected)+'</div></div></div>';
+      } else if(s===4){
+        const effHex = state.customHex || (config.colors.find(c=>c.key===state.color)||{}).hex || '#B7CC33';
+        html = '<div class="eyebrow on-light step-kicker">'+i18n.stepOfLabel.replace('{n}',5)+'</div>'+
+          '<h2>'+i18n.stepTitle[4]+'</h2><p class="step-intro">'+i18n.stepIntro[4]+'</p>'+
+          '<div class="option-grid">'+config.patterns.map(p=>
+            optionCard('pattern',p.key,p.label,p.desc,'<div class="motif-preview">'+patternIcon(p.key,effHex)+'</div>')
+          ).join('')+'</div>';
+      } else if(s===5){
+        html = '<div class="eyebrow on-light step-kicker">'+i18n.stepOfLabel.replace('{n}',6)+'</div>'+
+          '<h2>'+i18n.stepTitle[5]+'</h2><p class="step-intro">'+i18n.stepIntro[5]+'</p>'+
+          '<div class="upload-zone" id="'+uid('uploadZone')+'"><p style="font-size:15px;opacity:0.85;font-weight:600;">'+i18n.uploadTitle+'</p><p>'+i18n.uploadHint+'</p>'+
+          '<input type="file" id="'+uid('fileInput')+'" accept="image/*" multiple style="display:none;"></div>'+
+          '<div class="upload-thumbs" id="'+uid('uploadThumbs')+'"></div>'+
+          '<div class="notes-field"><label>'+i18n.notesLabel+'</label><textarea id="'+uid('notesInput')+'" placeholder="'+i18n.notesPlaceholder+'">'+state.notes+'</textarea></div>';
+      } else if(s===6){
+        html = '<div class="eyebrow on-light step-kicker">'+i18n.stepOfLabel.replace('{n}',7)+'</div>'+
+          '<h2>'+i18n.stepTitle[6]+'</h2><p class="step-intro">'+i18n.stepIntro[6]+'</p>'+
+          '<div class="contact-grid">'+
+            '<div><label>'+i18n.nameLabel+'</label><input class="field-input" id="'+uid('nameInput')+'" value="'+state.name+'"></div>'+
+            '<div><label>'+i18n.emailLabel+'</label><input class="field-input" type="email" id="'+uid('emailInput')+'" value="'+state.email+'"></div>'+
+            '<div><label>'+i18n.phoneLabel+'</label>'+phoneFieldHTML('id="'+uid('phoneCode')+'"', 'id="'+uid('phoneInput')+'"', state.phoneCode, state.phone)+'</div>'+
+            '<div><label>'+i18n.showroomLabel+'</label><select class="field-input" id="'+uid('showroomInput')+'"><option value="">'+i18n.notSelected+'</option>'+
+              config.showrooms.map(sr=>'<option value="'+sr.key+'"'+(state.showroom===sr.key?' selected':'')+'>'+sr.label+'</option>').join('')+'</select></div>'+
+            '<div class="field-full"><label>'+i18n.contactMethodLabel+'</label><select class="field-input" id="'+uid('contactMethodInput')+'"><option value="">'+i18n.notSelected+'</option>'+
+              config.contactMethods.map(cm=>'<option value="'+cm.key+'"'+(state.contactMethod===cm.key?' selected':'')+'>'+cm.label+'</option>').join('')+'</select></div>'+
+          '</div>'+
+          '<div class="review-panel"><h4>'+i18n.reviewTitle+'</h4><div id="'+uid('reviewRows')+'"></div></div>'+
+          '<div style="margin-top:28px;"><button type="button" class="btn btn-fill" id="'+uid('sendBtn')+'" disabled>'+i18n.sendBtn+'</button>'+
+          '<p class="send-note">'+i18n.sendNote+'</p></div>'+
+          '<div class="submit-success" id="'+uid('submitSuccess')+'"><div class="check-lg">\u2713</div><h2>'+i18n.successTitle+'</h2><p class="step-intro" style="margin:0 auto;">'+i18n.successBody+'</p></div>';
+      }
+      stepContainer.innerHTML = html;
+
+      if(s===6) renderReviewRows();
+      wireStepInputs();
+    }
+
+    function renderReviewRows(){
+      const el = stepContainer.querySelector('#'+uid('reviewRows'));
+      if(!el) return;
+      const L = i18n.summaryLabels;
+      const dash = i18n.notSelected;
+      const roomLabel = state.room ? (config.rooms.find(r=>r.key===state.room)||{}).label : dash;
+      const shapeLabel = state.shape ? (config.shapes.find(s=>s.key===state.shape)||{}).label : dash;
+      const dims = state.shape==='custom' ? (state.customShapeDesc || dash) :
+        state.shape==='round' ? ('\u2300 '+state.widthM.toFixed(1)+i18n.unitSuffix) :
+        state.shape ? (state.widthM.toFixed(1)+i18n.unitSuffix+' \u00d7 '+(state.shape==='square'?state.widthM.toFixed(1):state.lengthM.toFixed(1))+i18n.unitSuffix) : dash;
+      const materialLabel = state.material ? (config.materials.find(m=>m.key===state.material)||{}).label : dash;
+      const colorLabel = state.customHex ? state.customHex.toUpperCase() : (state.color ? (config.colors.find(c=>c.key===state.color)||{}).label : dash);
+      const patternLabel = state.pattern ? (config.patterns.find(p=>p.key===state.pattern)||{}).label : dash;
+      const rows = [[L.room,roomLabel],[L.shape,shapeLabel],[L.dimensions,dims],[L.material,materialLabel],[L.color,colorLabel],[L.pattern,patternLabel],[L.notes, state.notes||dash]];
+      el.innerHTML = rows.map(r=>'<div class="preview-summary-row summary-light"><span>'+r[0]+'</span><span>'+r[1]+'</span></div>').join('');
+    }
+
+    function buildMailto(){
+      const L = i18n.emailFieldLabels;
+      const dash = i18n.notSelected;
+      const dims = state.shape==='custom' ? (state.customShapeDesc||dash) :
+        state.shape==='round' ? ('\u00d8 '+state.widthM.toFixed(1)+i18n.unitSuffix) :
+        (state.widthM.toFixed(1)+i18n.unitSuffix+' x '+(state.shape==='square'?state.widthM.toFixed(1):state.lengthM.toFixed(1))+i18n.unitSuffix);
+      const lines = [
+        L.room+': '+(state.room ? (config.rooms.find(r=>r.key===state.room)||{}).label : dash),
+        L.shape+': '+(state.shape ? (config.shapes.find(s=>s.key===state.shape)||{}).label : dash),
+        L.dimensions+': '+dims,
+        L.material+': '+(state.material ? (config.materials.find(m=>m.key===state.material)||{}).label : dash),
+        L.color+': '+(state.customHex ? state.customHex.toUpperCase() : (state.color ? (config.colors.find(c=>c.key===state.color)||{}).label : dash)),
+        L.pattern+': '+(state.pattern ? (config.patterns.find(p=>p.key===state.pattern)||{}).label : dash),
+        L.notes+': '+(state.notes||dash),
+        '',
+        L.name+': '+state.name,
+        L.email+': '+state.email,
+        L.phone+': '+(state.phone ? state.phoneCode+' '+state.phone : dash),
+        L.showroom+': '+(state.showroom ? (config.showrooms.find(sr=>sr.key===state.showroom)||{}).label : dash),
+        L.contactMethod+': '+(state.contactMethod ? (config.contactMethods.find(cm=>cm.key===state.contactMethod)||{}).label : dash)
+      ];
+      const subject = encodeURIComponent(i18n.emailSubject);
+      const body = encodeURIComponent(lines.join('\n'));
+      return 'mailto:info@heritagecarpet.sa?subject='+subject+'&body='+body;
+    }
+
+    function renderThumbs(){
+      const el = stepContainer.querySelector('#'+uid('uploadThumbs'));
+      if(!el) return;
+      el.innerHTML = state.files.map((f,i)=>'<div class="upload-thumb"><img src="'+f.dataUrl+'" alt="'+f.name+'"><button type="button" data-remove="'+i+'">\u2715</button></div>').join('');
+    }
+
+    function wireStepInputs(){
+      stepContainer.querySelectorAll('.option-card, .color-option').forEach(card=>{
+        card.addEventListener('click', function(){
+          const field = card.dataset.field, value = card.dataset.value;
+          state[field] = value;
+          if(field==='color') state.customHex = null;
+          if(field==='shape'){
+            if(value==='round' || value==='square') state.lengthM = state.widthM;
+          }
+          updateContinueState();
+          renderStepContent();
+          renderRugPreview();
+        });
+      });
+
+      const widthInput = stepContainer.querySelector('#'+uid('widthInput'));
+      if(widthInput) widthInput.addEventListener('input', function(){
+        state.widthM = parseFloat(widthInput.value)||0;
+        if(state.shape==='round'||state.shape==='square') state.lengthM = state.widthM;
+        updateContinueState();
+        renderRugPreview();
+      });
+      const lengthInput = stepContainer.querySelector('#'+uid('lengthInput'));
+      if(lengthInput) lengthInput.addEventListener('input', function(){
+        state.lengthM = parseFloat(lengthInput.value)||0;
+        updateContinueState();
+        renderRugPreview();
+      });
+      const customShapeInput = stepContainer.querySelector('#'+uid('customShapeInput'));
+      if(customShapeInput) customShapeInput.addEventListener('input', function(){
+        state.customShapeDesc = customShapeInput.value;
+      });
+
+      const customColorInput = stepContainer.querySelector('#'+uid('customColorInput'));
+      if(customColorInput) customColorInput.addEventListener('input', function(){
+        state.customHex = customColorInput.value;
+        state.color = null;
+        const readout = stepContainer.querySelector('#'+uid('hexReadout'));
+        if(readout) readout.textContent = state.customHex.toUpperCase();
+        stepContainer.querySelectorAll('.color-option').forEach(c=>c.classList.remove('selected'));
+        updateContinueState();
+        renderRugPreview();
+      });
+
+      const uploadZone = stepContainer.querySelector('#'+uid('uploadZone'));
+      const fileInput = stepContainer.querySelector('#'+uid('fileInput'));
+      if(uploadZone && fileInput){
+        uploadZone.addEventListener('click', ()=>fileInput.click());
+        ['dragover','dragleave','drop'].forEach(evt=>{
+          uploadZone.addEventListener(evt, function(e){
+            e.preventDefault();
+            uploadZone.classList.toggle('dragover', evt==='dragover');
+          });
+        });
+        uploadZone.addEventListener('drop', function(e){ handleFiles(e.dataTransfer.files); });
+        fileInput.addEventListener('change', function(){ handleFiles(fileInput.files); });
+      }
+      function handleFiles(fileList){
+        Array.from(fileList).slice(0, 6 - state.files.length).forEach(file=>{
+          if(!file.type.startsWith('image/')) return;
+          const reader = new FileReader();
+          reader.onload = function(e){
+            state.files.push({name:file.name, dataUrl:e.target.result});
+            renderThumbs();
+          };
+          reader.readAsDataURL(file);
+        });
+      }
+      renderThumbs();
+      const thumbsEl = stepContainer.querySelector('#'+uid('uploadThumbs'));
+      if(thumbsEl) thumbsEl.addEventListener('click', function(e){
+        const btn = e.target.closest('[data-remove]');
+        if(!btn) return;
+        state.files.splice(parseInt(btn.dataset.remove,10),1);
+        renderThumbs();
+      });
+      const notesInput = stepContainer.querySelector('#'+uid('notesInput'));
+      if(notesInput) notesInput.addEventListener('input', function(){ state.notes = notesInput.value; });
+
+      ['nameInput','emailInput','phoneInput'].forEach(base=>{
+        const el = stepContainer.querySelector('#'+uid(base));
+        if(el) el.addEventListener('input', function(){
+          state[base.replace('Input','')] = el.value;
+          if(base === 'phoneInput') updatePhoneHint(el, root.getAttribute('data-lang') || 'en');
+          updateSendState();
+        });
+      });
+      const phoneCodeInput = stepContainer.querySelector('#'+uid('phoneCode'));
+      if(phoneCodeInput) phoneCodeInput.addEventListener('change', function(){ state.phoneCode = phoneCodeInput.value; });
+      const showroomInput = stepContainer.querySelector('#'+uid('showroomInput'));
+      if(showroomInput) showroomInput.addEventListener('change', function(){ state.showroom = showroomInput.value || null; });
+      const contactMethodInput = stepContainer.querySelector('#'+uid('contactMethodInput'));
+      if(contactMethodInput) contactMethodInput.addEventListener('change', function(){ state.contactMethod = contactMethodInput.value || null; });
+
+      const sendBtn = stepContainer.querySelector('#'+uid('sendBtn'));
+      if(sendBtn){
+        updateSendState();
+        sendBtn.addEventListener('click', function(){
+          // record to the Bespoke sheet before handing off to the mail client.
+          // Labels are resolved the same way buildMailto() does them, so the
+          // sheet row and the email the client receives always agree.
+          const dash = '';
+          const lbl = (list, key)=>{ const f = key ? (list.find(x=>x.key===key)||{}) : {}; return f.label || dash; };
+          const dims = state.shape==='custom' ? (state.customShapeDesc||dash) :
+            state.shape==='round' ? ('\u00d8 '+state.widthM.toFixed(1)+i18n.unitSuffix) :
+            (state.widthM.toFixed(1)+i18n.unitSuffix+' x '+(state.shape==='square'?state.widthM.toFixed(1):state.lengthM.toFixed(1))+i18n.unitSuffix);
+          sendToSheet(SHEET_WEBHOOKS.bespoke, {
+            form:          'bespoke',
+            room:          lbl(config.rooms, state.room),
+            shape:         lbl(config.shapes, state.shape),
+            dimensions:    dims,
+            material:      lbl(config.materials, state.material),
+            colour:        state.customHex ? state.customHex.toUpperCase() : lbl(config.colors, state.color),
+            pattern:       lbl(config.patterns, state.pattern),
+            designNotes:   state.notes || '',
+            name:          state.name || '',
+            email:         state.email || '',
+            phone:         state.phone ? state.phoneCode+' '+state.phone : '',
+            showroom:      lbl(config.showrooms, state.showroom),
+            contactMethod: lbl(config.contactMethods, state.contactMethod),
+            referenceImages: (state.files||[]).length,
+            language:      root.getAttribute('data-lang') || 'en',
+            submittedAt:   new Date().toISOString()
+          });
+          window.location.href = buildMailto();
+          const success = stepContainer.querySelector('#'+uid('submitSuccess'));
+          const grid = stepContainer.querySelector('.contact-grid');
+          const review = stepContainer.querySelector('.review-panel');
+          if(success){ success.classList.add('show'); }
+          if(grid) grid.style.display = 'none';
+          if(review) review.style.display = 'none';
+          sendBtn.style.display = 'none';
+          const note = stepContainer.querySelector('.send-note');
+          if(note) note.style.display = 'none';
+        });
+      }
+    }
+
+    function updateSendState(){
+      const sendBtn = stepContainer.querySelector('#'+uid('sendBtn'));
+      if(!sendBtn) return;
+      const validEmail = /\S+@\S+\.\S+/.test(state.email);
+      sendBtn.disabled = !(state.name.trim() && validEmail && isValidPhone(state.phone));
+    }
+
+    function updateContinueState(){
+      continueBtn.disabled = !canContinue();
+    }
+
+    function renderRugPreview(){
+      const canvas = root.querySelector('[data-role="preview-canvas"]');
+      const dimsEl = root.querySelector('[data-role="preview-dims"]');
+      if(!canvas) return;
+
+      const baseHex = state.customHex || (config.colors.find(c=>c.key===state.color) || {}).hex || '#C7C6C5';
+      const borderHex = shade(baseHex, isDarkColor(baseHex) ? 0.28 : -0.22);
+      const contrastHex = isDarkColor(baseHex) ? 'rgba(255,255,255,0.55)' : 'rgba(20,15,10,0.45)';
+
+      let svg;
+      if(state.shape === 'custom'){
+        svg = '<svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">'+
+          '<path d="M90 70 Q60 150 100 220 Q160 260 220 210 Q250 140 210 90 Q160 50 90 70Z" fill="'+baseHex+'" stroke="'+borderHex+'" stroke-width="10"/>'+
+          patternGlyph(state.pattern, contrastHex, 150, 150, 60)+
+          '</svg>';
+        canvas.innerHTML = svg;
+        if(dimsEl) dimsEl.textContent = config.i18n.customPreviewNote;
+        renderPreviewSummary();
+        return;
+      }
+
+      const isRound = state.shape === 'round';
+      const isSquare = state.shape === 'square';
+      const widthM = state.widthM || 1;
+      const lengthM = isRound ? widthM : (isSquare ? state.widthM : (state.lengthM || 1));
+      const maxM = Math.max(widthM, lengthM, 0.5);
+      const scale = 230 / maxM;
+      const rw = widthM * scale, rh = lengthM * scale;
+      const x = (300 - rw) / 2, y = (300 - rh) / 2;
+      const cx = 150, cy = 150;
+      const glyphR = Math.min(rw, rh) * 0.32;
+
+      let shapeSVG;
+      if(isRound){
+        const radius = rw/2;
+        shapeSVG = '<circle cx="'+cx+'" cy="'+cy+'" r="'+radius+'" fill="'+baseHex+'" stroke="'+borderHex+'" stroke-width="'+(radius*0.09)+'"/>';
+      } else {
+        shapeSVG = '<rect x="'+x+'" y="'+y+'" width="'+rw+'" height="'+rh+'" fill="'+baseHex+'" stroke="'+borderHex+'" stroke-width="'+(Math.min(rw,rh)*0.07)+'"/>';
+      }
+
+      svg = '<svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">'+
+        '<rect x="4" y="4" width="292" height="292" fill="none" stroke="rgba(212,184,118,0.15)" stroke-width="1"/>'+
+        shapeSVG +
+        patternGlyph(state.pattern, contrastHex, cx, cy, glyphR) +
+        '</svg>';
+      canvas.innerHTML = svg;
+
+      if(dimsEl){
+        if(isRound) dimsEl.textContent = '\u2300 ' + widthM.toFixed(1) + config.i18n.unitSuffix;
+        else dimsEl.textContent = widthM.toFixed(1) + config.i18n.unitSuffix + ' \u00d7 ' + lengthM.toFixed(1) + config.i18n.unitSuffix;
+      }
+      renderPreviewSummary();
+    }
+
+    function renderPreviewSummary(){
+      const el = root.querySelector('[data-role="preview-summary"]');
+      if(!el) return;
+      const L = config.i18n.summaryLabels;
+      const dash = config.i18n.notSelected;
+      const roomLabel = state.room ? (config.rooms.find(r=>r.key===state.room)||{}).label : dash;
+      const shapeLabel = state.shape ? (config.shapes.find(s=>s.key===state.shape)||{}).label : dash;
+      const materialLabel = state.material ? (config.materials.find(m=>m.key===state.material)||{}).label : dash;
+      const colorLabel = state.customHex ? state.customHex.toUpperCase() : (state.color ? (config.colors.find(c=>c.key===state.color)||{}).label : dash);
+      const patternLabel = state.pattern ? (config.patterns.find(p=>p.key===state.pattern)||{}).label : dash;
+      const rows = [
+        [L.room, roomLabel], [L.shape, shapeLabel], [L.material, materialLabel],
+        [L.color, colorLabel], [L.pattern, patternLabel]
+      ];
+      el.innerHTML = rows.map(r=>'<div class="preview-summary-row"><span>'+r[0]+'</span><span>'+r[1]+'</span></div>').join('');
+    }
+
+    function goTo(step, opts){
+      opts = opts || {};
+      if(step<0 || step>=STEP_COUNT) return;
+      if(step > state.maxReached + 1) return;
+      state.step = step;
+      if(step > state.maxReached) state.maxReached = step;
+      backBtn.style.visibility = step===0 ? 'hidden' : 'visible';
+      continueBtn.style.display = step===STEP_COUNT-1 ? 'none' : 'inline-flex';
+      renderProgress();
+      renderStepContent();
+      updateContinueState();
+      renderRugPreview();
+      // Scrolling to the step is for moving BETWEEN steps, so someone who has
+      // scrolled down to a Continue button lands back on the new step. On the
+      // initial render it is wrong: it dragged the page past its header and
+      // opened Bespoke Studio halfway down.
+      if(!opts.initial && stepContainer.scrollIntoView){
+        stepContainer.scrollIntoView({behavior: reducedMotion ? 'auto' : 'smooth', block:'start'});
+      }
+    }
+
+    progressEl.addEventListener('click', function(e){
+      const dot = e.target.closest('.step-dot.clickable');
+      if(!dot) return;
+      goTo(parseInt(dot.dataset.goto,10));
+    });
+    backBtn.addEventListener('click', function(){ goTo(state.step-1); });
+    continueBtn.addEventListener('click', function(){ if(canContinue()) goTo(state.step+1); });
+
+    goTo(0, {initial:true});
+  }
+
+  document.addEventListener('DOMContentLoaded', initCommon);
+
+  return { SHOPIFY_STORE, sendToSheet, isValidPhone, phoneDigits, PHONE_LENGTHS, motifSVG, renderHomePage, renderCollectionsPage, renderBespokeStudio, renderProductPage, renderProjectsPage, renderContentPage, renderBrandsPage, renderLocationsPage, renderOffersPage, renderBookingPage, renderRoomVisualizer, setLanguage, resolveImages, buildCarouselMarkup, initCarousels };
+})();
